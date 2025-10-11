@@ -39,9 +39,6 @@ def main(settings, modules, titles, paths):
     target_file = Path(raw_path)
     target_dir = target_file.parent
 
-    #print(f"File: {target_file}")
-    #print(f"Dir:  {target_dir}")
-
     parser_path = paths.get("dfir_toolbox_open_tl_path")
     cmd = [
         parser_path,
