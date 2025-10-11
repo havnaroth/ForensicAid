@@ -48,3 +48,7 @@ python setup.py
 
 ## **No guarantees that it will work, that it will not break your system.**  
 **You're launching this on your own responsibility.**
+
+TODO:
+- Qemu VHDX->DD
+- ArtifactExtractor 
