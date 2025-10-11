@@ -10,13 +10,13 @@ def main():
     raw_path = sys.argv[1].strip('"').strip()
     target_file = Path(raw_path)
     target_dir = target_file.parent
-    sigma_path = r"C:\Users\xxxxx\Desktop\chainsaw\chainsaw\sigma_rules"
-    mapping = r"C:\Users\xxxxx\Desktop\chainsaw\chainsaw\mapping_files\sigma-mapping.yml"
+    sigma_path = r"C:\Users\XXXXX\chainsaw\sigma_rules"
+    mapping = r"C:\Users\XXXXX\chainsaw\mapping_files\sigma-mapping.yml"
 
     #print(f"File: {target_file}")
     #print(f"Dir:  {target_dir}")
 
-    parser_path = r"C:\Users\xxxxx\Desktop\chainsaw\chainsaw\chainsaw.exe"
+    parser_path = r"C:\Users\XXXXX\chainsaw\chainsaw.exe"
     cmd = [
         parser_path,
          "hunt", str(target_dir),

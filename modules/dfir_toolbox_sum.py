@@ -14,7 +14,7 @@ def main():
     print(f"File: {target_file}")
     print(f"Dir:  {target_dir}")
 
-    parser_path = r"C:\Users\xxxxx\Desktop\SumECmd\SumECmd.exe"
+    parser_path = r"C:\Users\XXXXX\Desktop\SumECmd\SumECmd.exe"
     cmd = [
         parser_path,
         "-d", str(target_dir),
