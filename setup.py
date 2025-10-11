@@ -34,6 +34,7 @@ def enable_ansi_colors():
 
 BASE_KEY_PATH = r"*\shell\HannsForensics"
 
+    #Load config.ini 
 def load_config():
     config_path = os.path.join(os.path.dirname(__file__), "config.ini")
     config = configparser.ConfigParser()
@@ -43,20 +44,20 @@ def load_config():
 
     config.read(config_path)
 
-    # Read Settings
+    # Read Settings from config.ini
     settings = {}
     if "Settings" in config:
         for key, value in config["Settings"].items():
             settings[key.strip()] = value.strip()
 
-    # Read Enabled Modules
+    # Read Enabled Modules from config.ini
     enabled_modules = []
     if "Modules" in config:
         for key, value in config["Modules"].items():
             if value.strip().upper() == "TRUE":
                 enabled_modules.append(key.strip())
 
-    # Read Titles
+    # Read Titles from config.ini
     titles = {}
     if "Titles" in config:
         for key, value in config["Titles"].items():

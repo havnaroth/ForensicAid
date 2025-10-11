@@ -58,3 +58,5 @@ python setup.py
 - KAPE
 - RDPCache Parser  
 - EvtxECmd - need to think about relevant EventID list 
+
+- Improving setup to detect if APP paths were updated from default in config.ini and prompt a warning
