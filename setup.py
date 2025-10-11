@@ -224,3 +224,4 @@ if __name__ == "__main__":
         write_subcommands(modules)
         check_commandstore_keys(modules, titles, settings)
         install_modules(modules, settings)
+    print (f"{RED}!!! Remember that each module needs to have its related tool paths set correctly inside the module script!!!{RESET}")
