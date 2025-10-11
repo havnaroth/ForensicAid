@@ -14,7 +14,7 @@ def main():
     #print(f"File: {target_file}")
     #print(f"Dir:  {target_dir}")
 
-    parser_path = r"C:\Users\Hannon\Desktop\TimelineExplorer\TimelineExplorer.exe"
+    parser_path = r"C:\Users\XXXXX\Desktop\TimelineExplorer\TimelineExplorer.exe"
     cmd = [
         parser_path,
          str(target_file),
