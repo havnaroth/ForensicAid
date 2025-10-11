@@ -209,6 +209,40 @@ def install_modules(modules, settings):
         except Exception as e:
             print(f"{RED}[✘] Error copying {module}.py: {e}{RESET}")
 
+def handle_icon(settings):
+    base_dir = os.path.dirname(__file__)
+    icon_src = os.path.join(base_dir, "icon.ico")
+    install_dir = settings.get("installation_path", "").strip()
+
+    if not os.path.isfile(icon_src):
+        print(f"{RED}[✘] ICON NOT FOUND: {icon_src}{RESET}")
+        return
+
+    if not install_dir:
+        print(f"{RED}[✘] No installation_path defined in config.ini. Cannot copy icon.{RESET}")
+        return
+
+    icon_dst = os.path.join(install_dir, "icon.ico")
+
+    try:
+        shutil.copy2(icon_src, icon_dst)
+        print(f"{GREEN}[✔] icon.ico copied to: {icon_dst}{RESET}")
+    except Exception as e:
+        print(f"{RED}[✘] Failed to copy icon.ico: {e}{RESET}")
+        return
+
+    # Registry: HKEY_CLASSES_ROOT\*\shell\HannsForensics\Icon
+    try:
+        key_path = r"*\shell\HannsForensics"
+        with winreg.CreateKey(winreg.HKEY_CLASSES_ROOT, key_path) as key:
+            winreg.SetValueEx(key, "Icon", 0, winreg.REG_SZ, icon_dst)
+            print(f"{GREEN}[✔] Registry icon set: {icon_dst}{RESET}")
+    except PermissionError:
+        print(f"{RED}[✘] Permission denied setting registry icon.{RESET}")
+    except Exception as e:
+        print(f"{RED}[✘] Failed to set registry icon: {e}{RESET}")
+
+
 
 if __name__ == "__main__":
     enable_ansi_colors()
@@ -225,3 +259,4 @@ if __name__ == "__main__":
         check_commandstore_keys(modules, titles, settings)
         install_modules(modules, settings)
     print (f"{RED}!!! Remember that each module needs to have its related EZ tool paths set correctly inside the module script!!!{RESET}")
+    handle_icon(settings)
