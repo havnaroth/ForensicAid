@@ -27,6 +27,8 @@
 ```
 Annoyed with lack of automation for repetetive tasks related to utilizing Eric Zimmerman's tools decided to prepare this Windows context menu addon via registry integration. Designed for threat hunters, incident responders, and forensic analysts who need fast access to EZ tools directly from Explorer.
 
+Referenced apps can be downloaded here https://ericzimmerman.github.io 
+
 ![Sample](sample.jpg)
 
 ---
@@ -49,6 +51,10 @@ python setup.py
 ## **No guarantees that it will work, that it will not break your system.**  
 **You're launching this on your own responsibility.**
 
-TODO:
+
+**List of planned modules :**
 - Qemu VHDX->DD
-- ArtifactExtractor 
+- ArtifactExtractor
+- KAPE
+- RDPCache Parser 
+- EvtxECmd - need to think about relevant EventID list 
