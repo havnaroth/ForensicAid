@@ -27,6 +27,8 @@
 ```
 Annoyed with lack of automation for repetetive tasks related to utilizing Eric Zimmerman's tools decided to prepare this Windows context menu addon via registry integration. Designed for threat hunters, incident responders, and forensic analysts who need fast access to EZ tools directly from Explorer. I tried to force this to work with bat files, but i failed so used python instead. 
 
+![Sample](sample.jpg)
+
 ---
 
 Installation
