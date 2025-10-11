@@ -42,4 +42,7 @@ Installation
 python setup.py
 ```
 5. After installation remember to update paths of EZ Tools in each module from config.ini
-6. No guarantees that it will work, that it will not break your system. You're launching this on your own responsibility. 
+
+
+## **No guarantees that it will work, that it will not break your system.**  
+**You're launching this on your own responsibility.**
