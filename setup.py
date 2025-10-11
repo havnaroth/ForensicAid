@@ -38,6 +38,7 @@ ASCII_ART = f"""{GREEN}
    Date   : 11.10.2025
 {RESET}"""
 
+
 # Enable ANSI color support in Windows CMD
 def enable_ansi_colors():
     kernel32 = ctypes.windll.kernel32
@@ -81,12 +82,18 @@ def verify_module_files(modules):
     modules_dir = os.path.join(base_dir, "modules")
     print("\n[📁] Verifying module scripts in 'modules' directory...")
 
+    missing = []
+
     for module in modules:
         expected_file = os.path.join(modules_dir, f"{module}.py")
-        if os.path.isfile(expected_file):
-            print(f"{GREEN}[✔] Found: {expected_file}{RESET}")
-        else:
-            print(f"{RED}[✘] Missing: {expected_file}{RESET}")
+        if not os.path.isfile(expected_file):
+            missing.append(expected_file)
+
+    if missing:
+        for path in missing:
+            print(f"{RED}[✘] Missing: {path}{RESET}")
+    else:
+        print(f"{GREEN}[✔] All expected modules are present.{RESET}")
 
 def check_installation_path(settings):
     path = settings.get("installation_path", "").strip()
