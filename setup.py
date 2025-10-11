@@ -26,8 +26,7 @@ ASCII_ART = f"""{YELLOW}
    Date   : 11.10.2025
 {RESET}"""
 
-
-# Enable ANSI color support in Windows CMD
+    # Enable ANSI color support in Windows CMD
 def enable_ansi_colors():
     kernel32 = ctypes.windll.kernel32
     handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
