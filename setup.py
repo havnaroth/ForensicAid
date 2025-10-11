@@ -230,12 +230,6 @@ def handle_icon(settings):
     except Exception as e:
         print(f"{RED}[✘] Failed to set registry icon: {e}{RESET}")
 
-
-import os
-import shutil
-import winreg
-import configparser
-
 def store_config_path_and_copy(config_filename="config.ini"):
     try:
         # Get source path (same dir as setup.py)
