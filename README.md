@@ -30,7 +30,7 @@ A modular setup utility for deploying forensic automation tools into the Windows
 
 ---
 
-## 📦 Installation
+Installation
 
 1. Clone the repository  
 2. Configure `config.ini`:
