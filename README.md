@@ -41,3 +41,5 @@ Installation
 
 ```bash
 python setup.py
+```
+5. After installation remember to update paths of EZ Tools in each module from config.ini
