@@ -37,7 +37,7 @@ Referenced apps can be downloaded here :
 
 ---
 
-Installation
+## **Installation**
 
 1. Clone the repository  
 2. Configure `config.ini`:
