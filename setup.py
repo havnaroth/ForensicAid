@@ -3,36 +3,24 @@ import winreg
 import configparser
 import ctypes
 import shutil
+import winreg
 
 # ANSI color codes
 RED = "\033[91m"
 GREEN = "\033[92m"
-YELLOW = "\033[93m"
+YELLOW = "\033[38;2;255;255;0m"  # RGB Yellow
 RESET = "\033[0m"
 
-ASCII_ART = f"""{GREEN}
- ██████████   ███████████ █████ ███████████                        
-░░███░░░░███ ░░███░░░░░░█░░███ ░░███░░░░░███                       
- ░███   ░░███ ░███   █ ░  ░███  ░███    ░███                       
- ░███    ░███ ░███████    ░███  ░██████████                        
- ░███    ░███ ░███░░░█    ░███  ░███░░░░░███                       
- ░███    ███  ░███  ░     ░███  ░███    ░███                       
- ██████████   █████       █████ █████   █████                      
-░░░░░░░░░░   ░░░░░       ░░░░░ ░░░░░   ░░░░░                       
-                                                                   
-                                                                   
-                                                                   
- ███████████                   ████  █████                         
-░█░░░███░░░█                  ░░███ ░░███                          
-░   ░███  ░   ██████   ██████  ░███  ░███████   ██████  █████ █████
-    ░███     ███░░███ ███░░███ ░███  ░███░░███ ███░░███░░███ ░░███ 
-    ░███    ░███ ░███░███ ░███ ░███  ░███ ░███░███ ░███ ░░░█████░  
-    ░███    ░███ ░███░███ ░███ ░███  ░███ ░███░███ ░███  ███░░░███ 
-    █████   ░░██████ ░░██████  █████ ████████ ░░██████  █████ █████
-   ░░░░░     ░░░░░░   ░░░░░░  ░░░░░ ░░░░░░░░   ░░░░░░  ░░░░░ ░░░░░ 
-                                                                   
-                                                                   
-                                                                   
+ASCII_ART = f"""{YELLOW}
+██████████   ███████████ █████ ███████████      ███████████                   ████  █████                         
+░░███░░░░███ ░░███░░░░░░█░░███ ░░███░░░░░███    ░█░░░███░░░█                  ░░███ ░░███                          
+ ░███   ░░███ ░███   █ ░  ░███  ░███    ░███    ░   ░███  ░   ██████   ██████  ░███  ░███████   ██████  █████ █████
+ ░███    ░███ ░███████    ░███  ░██████████         ░███     ███░░███ ███░░███ ░███  ░███░░███ ███░░███░░███ ░░███ 
+ ░███    ░███ ░███░░░█    ░███  ░███░░░░░███        ░███    ░███ ░███░███ ░███ ░███  ░███ ░███░███ ░███ ░░░█████░  
+ ░███    ███  ░███  ░     ░███  ░███    ░███        ░███    ░███ ░███░███ ░███ ░███  ░███ ░███░███ ░███  ███░░░███ 
+ ██████████   █████       █████ █████   █████       █████   ░░██████ ░░██████  █████ ████████ ░░██████  █████ █████
+░░░░░░░░░░   ░░░░░       ░░░░░ ░░░░░   ░░░░░       ░░░░░     ░░░░░░   ░░░░░░  ░░░░░ ░░░░░░░░   ░░░░░░  ░░░░░ ░░░░░ 
+                                                                                                                   
    Author : Mateusz Nowicki aka Hannon
    Version: 0.1
    Date   : 11.10.2025
@@ -121,7 +109,7 @@ def ensure_base_key_exists(settings):
         print(f"{YELLOW}[!] Base registry key not found. Creating...{RESET}")
         try:
             with winreg.CreateKey(winreg.HKEY_CLASSES_ROOT, BASE_KEY_PATH) as key:
-                winreg.SetValueEx(key, "MUIVerb", 0, winreg.REG_SZ, "Hanns Forensics")
+                winreg.SetValueEx(key, "MUIVerb", 0, winreg.REG_SZ, "Hann's Forensics")
                 winreg.SetValueEx(key, "SubCommands", 0, winreg.REG_SZ, "")
                 if "default_icon" in settings:
                     winreg.SetValueEx(key, "Icon", 0, winreg.REG_SZ, settings["default_icon"])
@@ -146,7 +134,7 @@ def check_commandstore_keys(modules, titles, settings):
     for module in modules:
         module_path = f"{base_path}\\{module}"
         expected_title = titles.get(module)
-        expected_command = f'cmd.exe /k "python {install_path}\\{module}.py\\"%1\\""'
+        expected_command = f'cmd.exe /k "python {install_path}\\{module}.py \\"%1\\"'
 
         if not expected_title:
             print(f"{YELLOW}[!] Warning: No title defined for {module} in [Titles] section.{RESET}")
@@ -202,7 +190,7 @@ def install_modules(modules, settings):
             continue
 
         try:
-            shutil.copy2(src, dst)
+            shutil.copy(src, dst)
             print(f"{GREEN}[✔] Installed: {module}.py → {dst}{RESET}")
         except PermissionError:
             print(f"{RED}[✘] Permission denied copying {module}.py to {dst}{RESET}")
@@ -243,11 +231,67 @@ def handle_icon(settings):
         print(f"{RED}[✘] Failed to set registry icon: {e}{RESET}")
 
 
+import os
+import shutil
+import winreg
+import configparser
+
+def store_config_path_and_copy(config_filename="config.ini"):
+    try:
+        # Get source path (same dir as setup.py)
+        script_dir = os.path.dirname(__file__)
+        config_src = os.path.join(script_dir, config_filename)
+
+        if not os.path.isfile(config_src):
+            print(f"{RED}[✘] Source config.ini not found: {config_src}{RESET}")
+            return
+
+        # Parse destination path from config.ini itself
+        config = configparser.ConfigParser()
+        config.read(config_src)
+
+        install_path = config.get("Settings", "installation_path", fallback="").rstrip("\\")
+        if not install_path:
+            print(f"{RED}[✘] installation_path missing in config.ini{RESET}")
+            return
+
+        config_dst = os.path.join(install_path, config_filename)
+
+        # Copy config.ini to installation path
+        try:
+            shutil.copy(config_src, config_dst)
+            print(f"{GREEN}[✔] config.ini copied to: {config_dst}{RESET}")
+        except Exception as e:
+            print(f"{RED}[✘] Failed to copy config.ini: {e}{RESET}")
+            return
+
+        # Write registry key
+        key_path = r"SOFTWARE\DFIR_Toolbox"
+        value_name = "ConfigPath"
+        with winreg.CreateKey(winreg.HKEY_LOCAL_MACHINE, key_path) as key:
+            winreg.SetValueEx(key, value_name, 0, winreg.REG_SZ, config_dst)
+            print(f"{GREEN}[✔] Registry updated:{RESET}")
+            print(f"{YELLOW}    Key:   HKEY_LOCAL_MACHINE\\{key_path}{RESET}")
+            print(f"{YELLOW}    Value: {value_name} = {config_dst}{RESET}")
+
+    except PermissionError:
+        print(f"{RED}[✘] Permission denied. Run as administrator to write registry.{RESET}")
+    except Exception as e:
+        print(f"{RED}[✘] Unexpected error: {e}{RESET}")
+
 
 if __name__ == "__main__":
     enable_ansi_colors()
     print(ASCII_ART)
     settings, modules, titles = load_config()
+
+
+    install_path = settings.get("installation_path", "").rstrip("\\")
+    config_file = os.path.join(install_path, "config.ini")
+    print(f"Config file path thats stored in registry: {config_file}")
+    store_config_path_and_copy()
+
+
     verify_module_files(modules)
     print(f"\nSettings: {settings}")
     print(f"Enabled modules: {modules}")
@@ -258,5 +302,6 @@ if __name__ == "__main__":
         write_subcommands(modules)
         check_commandstore_keys(modules, titles, settings)
         install_modules(modules, settings)
-    print (f"{RED}!!! Remember that each module needs to have its related EZ tool paths set correctly inside the module script!!!{RESET}")
+    print (f"{RED}!!! Remember that each module needs to have paths updated in config.ini !!!{RESET}")
+    print (f"{RED}!!! If needed - rerun setup to overwrite content of config.ini !!!{RESET}")
     handle_icon(settings)
