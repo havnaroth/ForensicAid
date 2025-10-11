@@ -38,10 +38,6 @@ def main(settings, modules, titles, paths):
     raw_path = sys.argv[1].strip('"').strip()
     target_file = Path(raw_path)
     target_dir = target_file.parent
-
-    print(f"File: {target_file}")
-    print(f"Dir:  {target_dir}")
-
     parser_path = paths.get("dfir_toolbox_sum_path")
     cmd = [
         parser_path,

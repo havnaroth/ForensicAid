@@ -43,7 +43,6 @@ def main(settings, modules, titles, paths):
     print(f"Dir:  {target_dir}")
 
     parser_path = paths.get("dfir_toolbox_amcache_path")
-    #parser_path = r"C:\Users\Hannon\Desktop\AmcacheParser\AmcacheParser.exe"
     cmd = [
         parser_path,
         "-f", str(target_file),
