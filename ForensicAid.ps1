@@ -42,6 +42,8 @@ $HistoryLog = Join-Path $InstallDir 'history.log'
 $StateFile  = Join-Path $InstallDir 'menu.state.json'   # items switched off from the tray icon
 $LastOutput = Join-Path $InstallDir 'last_output.txt'
 $TrayScript = Join-Path $InstallDir 'ForensicAidTray.ps1'
+$MenuJson   = Join-Path $InstallDir 'menu.json'   # read by the Windows 11 extension
+$ShellPackage = 'ForensicAid.ShellExtension'
 $RunKey     = 'Software\Microsoft\Windows\CurrentVersion\Run'
 $Esentutl   = Join-Path $env:windir 'System32\esentutl.exe'
 
@@ -90,6 +92,7 @@ $Defaults = @{
     HideUnavailable  = $true
     Disabled         = @()
     EnableLogging    = $true
+    Win11Menu        = $true
 }
 
 $script:Config       = $null
@@ -766,6 +769,101 @@ function Invoke-ToRaw($c) {
     if ([IO.File]::Exists($dst)) { Write-Ok "RAW image: $dst" }
 }
 
+# RDP bitmap cache of mstsc: CacheNNNN.bin (RDP 8+: "RDP8bmp" + version, then tiles of 8-byte key,
+# UInt16 width, UInt16 height, width*height*4 bytes BGRA top-down) and the older bcache*.bmc (20-byte
+# tile header: keys, width, height, length, flags; bottom-up, 16/24/32 bpp; RLE-compressed tiles are
+# counted but not decoded). Every tile is saved as PNG, plus a collage per cache file for quick review.
+function Export-RdpCacheFile([string]$File, [string]$OutDir) {
+    Add-Type -AssemblyName System.Drawing
+    $data = [IO.File]::ReadAllBytes($File)   # mstsc keeps each cache file around 100 MB at most
+    $name = Get-SafeName ([IO.Path]::GetFileName($File))
+    $isBin = $data.Length -ge 12 -and [Text.Encoding]::ASCII.GetString($data, 0, 7) -eq 'RDP8bmp'
+    $isBmc = [IO.Path]::GetExtension($File) -ieq '.bmc'
+    $result = [pscustomobject]@{ File = $File; Format = $(if ($isBin) { 'RDP8 .bin' } elseif ($isBmc) { 'bmc' } else { 'unknown' }); Tiles = 0; Skipped = 0; Collage = '' }
+    if (-not ($isBin -or $isBmc)) { return $result }
+
+    $tileDir = Join-Path $OutDir $name
+    [void][IO.Directory]::CreateDirectory($tileDir)
+    $bitmaps = [System.Collections.Generic.List[object]]::new()
+    $pos = if ($isBin) { 12 } else { 0 }
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($true) {
+        if ($isBin) {
+            if ($pos + 12 -gt $data.Length) { break }
+            $w = [BitConverter]::ToUInt16($data, $pos + 8); $h = [BitConverter]::ToUInt16($data, $pos + 10)
+            $bpp = 4; $len = $w * $h * 4; $start = $pos + 12; $compressed = $false; $bottomUp = $false
+        } else {
+            if ($pos + 20 -gt $data.Length) { break }
+            $w = [BitConverter]::ToUInt16($data, $pos + 8); $h = [BitConverter]::ToUInt16($data, $pos + 10)
+            $len = [BitConverter]::ToUInt32($data, $pos + 12); $flags = [BitConverter]::ToUInt32($data, $pos + 16)
+            $start = $pos + 20; $compressed = ($flags -band 0x08) -ne 0; $bottomUp = $true
+            $bpp = if ($w * $h) { $len / ($w * $h) } else { 0 }
+        }
+        if ($w -eq 0 -or $h -eq 0 -or $w -gt 256 -or $h -gt 256 -or $start + $len -gt $data.Length) { break }
+        $pos = $start + $len
+
+        $format = switch ($bpp) { 4 { 'Format32bppRgb' } 3 { 'Format24bppRgb' } 2 { 'Format16bppRgb565' } default { $null } }
+        if ($compressed -or -not $format) { $result.Skipped++; continue }
+
+        $bmp = New-Object System.Drawing.Bitmap($w, $h, [System.Drawing.Imaging.PixelFormat]::$format)
+        $bd = $bmp.LockBits((New-Object System.Drawing.Rectangle(0, 0, $w, $h)), 'WriteOnly', $bmp.PixelFormat)
+        $row = $w * $bpp
+        if (-not $bottomUp -and $bd.Stride -eq $row) {
+            [Runtime.InteropServices.Marshal]::Copy($data, $start, $bd.Scan0, $len)
+        } else {
+            for ($y = 0; $y -lt $h; $y++) {
+                $src = if ($bottomUp) { $h - 1 - $y } else { $y }
+                [Runtime.InteropServices.Marshal]::Copy($data, $start + $src * $row, [IntPtr]($bd.Scan0.ToInt64() + $y * $bd.Stride), $row)
+            }
+        }
+        $bmp.UnlockBits($bd)
+        $bmp.Save((Join-Path $tileDir ('{0}_{1:D5}.png' -f $name, $bitmaps.Count)), [System.Drawing.Imaging.ImageFormat]::Png)
+        $bitmaps.Add($bmp)
+        if ($sw.ElapsedMilliseconds -gt 500) {
+            Write-Progress -Activity "RDP cache $name" -Status "$($bitmaps.Count) tiles" -PercentComplete ([int](100 * $pos / $data.Length))
+            $sw.Restart()
+        }
+    }
+    Write-Progress -Activity "RDP cache $name" -Completed
+    $result.Tiles = $bitmaps.Count
+
+    # Collage in file order (64 tiles per row): neighbouring tiles often belong to the same screen.
+    if ($bitmaps.Count) {
+        $cols = [Math]::Min(64, $bitmaps.Count)
+        $rows = [Math]::Ceiling($bitmaps.Count / $cols)
+        $collage = New-Object System.Drawing.Bitmap(($cols * 64), ([int]$rows * 64))
+        $g = [System.Drawing.Graphics]::FromImage($collage)
+        $g.Clear([System.Drawing.Color]::Black)
+        for ($i = 0; $i -lt $bitmaps.Count; $i++) { $g.DrawImageUnscaled($bitmaps[$i], ($i % $cols) * 64, [Math]::Floor($i / $cols) * 64) }
+        $g.Dispose()
+        $result.Collage = Join-Path $OutDir "$name`_collage.png"
+        $collage.Save($result.Collage, [System.Drawing.Imaging.ImageFormat]::Png)
+        $collage.Dispose()
+    }
+    foreach ($b in $bitmaps) { $b.Dispose() }
+    return $result
+}
+
+function Invoke-RdpCache($c) {
+    $files = if ($c.IsDir) {
+        @(Get-ChildItem -LiteralPath $c.Path -Recurse -File -Force -ErrorAction SilentlyContinue |
+          Where-Object { ($_.Name -like 'Cache*.bin' -or $_.Extension -ieq '.bmc') -and $_.Length -gt 0 -and -not (Test-OwnOutput $_.FullName) } |
+          ForEach-Object { $_.FullName })
+    } else { @($c.Path) }
+    if (-not $files.Count) { throw "No RDP bitmap cache files (Cache*.bin, bcache*.bmc) under $($c.Path)" }
+
+    $results = foreach ($f in $files) {
+        Write-Info "Parsing $f"
+        $r = Export-RdpCacheFile $f $c.Out
+        if ($r.Format -eq 'unknown') { Write-Warn "Not an RDP bitmap cache: $f" }
+        else { Write-Ok ("{0}: {1} tiles{2}" -f [IO.Path]::GetFileName($f), $r.Tiles, $(if ($r.Skipped) { ", $($r.Skipped) compressed/unsupported skipped" } else { '' })) }
+        Write-Log ("RDPCACHE `"{0}`" format={1} tiles={2} skipped={3}" -f $f, $r.Format, $r.Tiles, $r.Skipped)
+        $r
+    }
+    $results | Export-Csv -LiteralPath (Join-Path $c.Out 'rdpcache_summary.csv') -NoTypeInformation -Encoding UTF8
+    if (-not ($results | Where-Object { $_.Tiles -gt 0 })) { $script:ToolFailures++; Write-Warn 'No tiles extracted.' }
+}
+
 function Invoke-Triage($c) {
     if ($c.Path.TrimEnd('\') -ieq $env:SystemDrive) {
         Write-Warn "This is the live system drive ($($c.Path)). Triage is meant for collected/mounted evidence."
@@ -802,6 +900,7 @@ function Invoke-Triage($c) {
     foreach ($f in (& $named 'Current.mdb'))        { & $addFile 'ual' $f }
     foreach ($f in (& $named 'ActivitiesCache.db')) { & $addFile 'activities' $f }
     if (@($byName.Keys | Where-Object { $_ -like '$i*' -and $_ -ne '$i30' } | Select-Object -First 1).Count) { & $addDir 'recyclebin' }
+    if ($exts['.bmc'] -or @($byName.Keys | Where-Object { $_ -like 'cache000?.bin' } | Select-Object -First 1).Count) { & $addDir 'rdpcache' }
 
     if (-not $steps.Count) { throw "No known artifacts found under $($c.Path)" }
     Write-Info "$($steps.Count) parser run(s) planned."
@@ -874,21 +973,29 @@ function Show-Doctor {
     Show-ToolTable
     Write-Host ''
     Write-Info 'Missing tools: drop them under one of the roots or set Tools.<Name> in the config, then use "Refresh menu".'
-    if ([Environment]::OSVersion.Version.Build -ge 22000) {
-        Write-Info 'Windows 11: the menu is under "Show more options" (or Shift+Right-click).'
-    }
+    Write-MenuHint
 }
 
 #endregion
 
 #region Catalog
 
-function Aqs([string[]]$Ext = @(), [string[]]$Name = @(), [string[]]$Prefix = @()) {
+# File filter for an item: shown when the name has one of Ext, equals one of Name or starts with a Prefix,
+# and is not in Exclude (all case-insensitive). Feeds both AppliesTo (classic menu) and menu.json (Windows 11).
+function FileMatch([string[]]$Ext = @(), [string[]]$Name = @(), [string[]]$Prefix = @(), [string[]]$Exclude = @()) {
+    return @{ Ext = $Ext; Name = $Name; Prefix = $Prefix; Exclude = $Exclude }
+}
+
+function ConvertTo-Aqs($Match) {
     $p = @()
-    foreach ($e in $Ext)    { $p += 'System.FileExtension:="{0}"' -f $e }
-    foreach ($n in $Name)   { $p += 'System.FileName:="{0}"' -f $n }
-    foreach ($x in $Prefix) { $p += 'System.FileName:~<"{0}"' -f $x }
-    return ($p -join ' OR ')
+    foreach ($e in $Match.Ext)    { $p += 'System.FileExtension:="{0}"' -f $e }
+    foreach ($n in $Match.Name)   { $p += 'System.FileName:="{0}"' -f $n }
+    foreach ($x in $Match.Prefix) { $p += 'System.FileName:~<"{0}"' -f $x }
+    $aqs = $p -join ' OR '
+    if (@($Match.Exclude).Count) {
+        $aqs = '({0}) AND {1}' -f $aqs, ((@($Match.Exclude) | ForEach-Object { 'System.FileName:<>"{0}"' -f $_ }) -join ' AND ')
+    }
+    return $aqs
 }
 
 # Menu order follows this list; a separator is drawn where Group changes.
@@ -898,48 +1005,51 @@ $Catalog = @(
     @{ Id = 'hash'; Title = 'Hash (MD5/SHA1/SHA256)'; Group = 1; Scope = 'File', 'Dir'; NoOutput = $true
        Run = { param($c) Invoke-Hash $c } }
     @{ Id = 'timeline'; Title = 'Open in Timeline Explorer'; Group = 1; Scope = 'File'; Tool = 'TimelineExplorer'
-       Match = (Aqs -Ext '.csv', '.xlsx', '.tle_sess'); NoOutput = $true; Hidden = $true; NoPause = $true
+       Match = (FileMatch -Ext '.csv', '.xlsx', '.tle_sess'); NoOutput = $true; Hidden = $true; NoPause = $true
        Run = { param($c) Start-Process -FilePath (Resolve-Tool TimelineExplorer) -ArgumentList (ConvertTo-ArgumentString @($c.Path)) } }
     @{ Id = 'triage'; Title = 'Full triage (all parsers)'; Group = 1; Scope = 'Dir'
        Run = { param($c) Invoke-Triage $c } }
 
     @{ Id = 'chainsaw'; Title = 'Event logs - Chainsaw hunt'; Group = 2; Scope = 'File', 'Dir'; Tool = 'Chainsaw'
-       Match = (Aqs -Ext '.evtx'); Run = { param($c) Invoke-Chainsaw $c } }
+       Match = (FileMatch -Ext '.evtx'); Run = { param($c) Invoke-Chainsaw $c } }
     @{ Id = 'evtx'; Title = 'Event logs - EvtxECmd'; Group = 2; Scope = 'File', 'Dir'; Tool = 'EvtxECmd'
-       Match = (Aqs -Ext '.evtx'); Run = { param($c) Invoke-Ez EvtxECmd $c } }
+       Match = (FileMatch -Ext '.evtx'); Run = { param($c) Invoke-Ez EvtxECmd $c } }
 
     @{ Id = 'mft'; Title = 'NTFS ($MFT/$J/$Boot/$SDS) - MFTECmd'; Group = 3; Scope = 'File'; Tool = 'MFTECmd'
-       Match = (Aqs -Name '$MFT', '$J', '$LogFile', '$Boot', '$SDS', '$Secure_$SDS', '$I30' -Prefix '$UsnJrnl'); Run = { param($c) Invoke-Mft $c } }
+       Match = (FileMatch -Name '$MFT', '$J', '$LogFile', '$Boot', '$SDS', '$Secure_$SDS', '$I30' -Prefix '$UsnJrnl'); Run = { param($c) Invoke-Mft $c } }
     @{ Id = 'prefetch'; Title = 'Prefetch - PECmd'; Group = 3; Scope = 'File', 'Dir'; Tool = 'PECmd'
-       Match = (Aqs -Ext '.pf'); Run = { param($c) Invoke-Ez PECmd $c -Quiet } }
+       Match = (FileMatch -Ext '.pf'); Run = { param($c) Invoke-Ez PECmd $c -Quiet } }
     @{ Id = 'lnk'; Title = 'LNK files - LECmd'; Group = 3; Scope = 'File', 'Dir'; Tool = 'LECmd'
-       Match = (Aqs -Ext '.lnk'); Run = { param($c) Invoke-Ez LECmd $c -Quiet } }
+       Match = (FileMatch -Ext '.lnk'); Run = { param($c) Invoke-Ez LECmd $c -Quiet } }
     @{ Id = 'jumplist'; Title = 'Jump lists - JLECmd'; Group = 3; Scope = 'File', 'Dir'; Tool = 'JLECmd'
-       Match = (Aqs -Ext '.automaticDestinations-ms', '.customDestinations-ms'); Run = { param($c) Invoke-Ez JLECmd $c -Quiet } }
+       Match = (FileMatch -Ext '.automaticDestinations-ms', '.customDestinations-ms'); Run = { param($c) Invoke-Ez JLECmd $c -Quiet } }
     @{ Id = 'recyclebin'; Title = 'Recycle Bin ($I) - RBCmd'; Group = 3; Scope = 'File', 'Dir'; Tool = 'RBCmd'
-       Match = '(System.FileName:~<"$I" AND System.FileName:<>"$I30")'; Run = { param($c) Invoke-Ez RBCmd $c -Quiet } }
+       Match = (FileMatch -Prefix '$I' -Exclude '$I30'); Run = { param($c) Invoke-Ez RBCmd $c -Quiet } }
+    @{ Id = 'rdpcache'; Title = 'RDP bitmap cache (tiles + collage)'; Group = 3; Scope = 'File', 'Dir'
+       Match = (FileMatch -Ext '.bmc' -Name 'Cache0000.bin', 'Cache0001.bin', 'Cache0002.bin', 'Cache0003.bin', 'Cache0004.bin')
+       Run = { param($c) Invoke-RdpCache $c } }
     @{ Id = 'amcache'; Title = 'Amcache - AmcacheParser'; Group = 3; Scope = 'File'; Tool = 'AmcacheParser'
-       Match = (Aqs -Name 'Amcache.hve'); Run = { param($c) Invoke-Ez AmcacheParser $c -Extra (@('-i') + @(Get-HiveArgs $c.Path) + @(Get-EzTempArgs AmcacheParser $c)) } }
+       Match = (FileMatch -Name 'Amcache.hve'); Run = { param($c) Invoke-Ez AmcacheParser $c -Extra (@('-i') + @(Get-HiveArgs $c.Path) + @(Get-EzTempArgs AmcacheParser $c)) } }
     @{ Id = 'shimcache'; Title = 'ShimCache - AppCompatCacheParser'; Group = 3; Scope = 'File'; Tool = 'AppCompatCacheParser'
-       Match = (Aqs -Name 'SYSTEM'); Run = { param($c) Invoke-Ez AppCompatCacheParser $c -Extra @(Get-HiveArgs $c.Path) } }
+       Match = (FileMatch -Name 'SYSTEM'); Run = { param($c) Invoke-Ez AppCompatCacheParser $c -Extra @(Get-HiveArgs $c.Path) } }
 
     @{ Id = 'registry'; Title = 'Registry - RECmd (batch)'; Group = 4; Scope = 'File', 'Dir'; Tool = 'RECmd'
-       Match = (Aqs -Name 'NTUSER.DAT', 'UsrClass.dat', 'SYSTEM', 'SOFTWARE', 'SAM', 'SECURITY', 'DEFAULT', 'Amcache.hve')
+       Match = (FileMatch -Name 'NTUSER.DAT', 'UsrClass.dat', 'SYSTEM', 'SOFTWARE', 'SAM', 'SECURITY', 'DEFAULT', 'Amcache.hve')
        Run = { param($c) Invoke-RECmd $c } }
     @{ Id = 'shellbags'; Title = 'ShellBags - SBECmd'; Group = 4; Scope = 'Dir'; Tool = 'SBECmd'
        Run = { param($c) Invoke-SBECmd $c } }
 
     @{ Id = 'srum'; Title = 'SRUM - SrumECmd'; Group = 5; Scope = 'File', 'Dir'; Tool = 'SrumECmd'
-       Match = (Aqs -Name 'SRUDB.dat'); Run = { param($c) Invoke-Srum $c } }
+       Match = (FileMatch -Name 'SRUDB.dat'); Run = { param($c) Invoke-Srum $c } }
     @{ Id = 'ual'; Title = 'UAL (SUM) - SumECmd'; Group = 5; Scope = 'File', 'Dir'; Tool = 'SumECmd'
-       Match = (Aqs -Ext '.mdb'); Run = { param($c) Invoke-Sum $c } }
+       Match = (FileMatch -Ext '.mdb'); Run = { param($c) Invoke-Sum $c } }
     @{ Id = 'activities'; Title = 'Windows Timeline - WxTCmd'; Group = 5; Scope = 'File'; Tool = 'WxTCmd'
-       Match = (Aqs -Name 'ActivitiesCache.db'); Run = { param($c) Invoke-WxT $c } }
+       Match = (FileMatch -Name 'ActivitiesCache.db'); Run = { param($c) Invoke-WxT $c } }
     @{ Id = 'ese-repair'; Title = 'Repair ESE database (copy)'; Group = 5; Scope = 'File'
-       Match = (Aqs -Ext '.edb', '.mdb' -Name 'SRUDB.dat' -Prefix 'WebCacheV'); Run = { param($c) Invoke-EseRepair $c } }
+       Match = (FileMatch -Ext '.edb', '.mdb' -Name 'SRUDB.dat' -Prefix 'WebCacheV'); Run = { param($c) Invoke-EseRepair $c } }
 
     @{ Id = 'to-raw'; Title = 'Disk image to RAW (.dd) - qemu-img'; Group = 6; Scope = 'File'; Tool = 'QemuImg'
-       Match = (Aqs -Ext '.vhdx', '.vhd', '.vmdk', '.qcow2', '.vdi'); Run = { param($c) Invoke-ToRaw $c } }
+       Match = (FileMatch -Ext '.vhdx', '.vhd', '.vmdk', '.qcow2', '.vdi'); Run = { param($c) Invoke-ToRaw $c } }
 
     @{ Id = 'doctor'; Title = 'Check tools'; Group = 9; Scope = 'File', 'Dir'; NoOutput = $true; NoPath = $true
        Run = { param($c) Show-Doctor } }
@@ -989,36 +1099,71 @@ function Register-Menu {
     $scriptPath = Join-Path $InstallDir 'ForensicAid.ps1'
     $icon = Join-Path $InstallDir 'icon.ico'
     $placeholders = @{ File = '%1'; Dir = '%1'; Background = '%V' }
+    $command = {
+        param($e, $placeholder)
+        $style = if ($e.Hidden) { ' -WindowStyle Hidden' } else { '' }
+        '"{0}" -NoProfile -ExecutionPolicy Bypass{1} -File "{2}" -Action {3} -Path "{4}"' -f $psExe, $style, $scriptPath, $e.Id, $placeholder
+    }
 
+    # Items that make it into the menu, with their tool icon.
+    $shown = foreach ($e in $Catalog) {
+        if (@($script:Config.Disabled) -contains $e.Id) { continue }
+        $exe = $null
+        if ($e.Tool) {
+            $exe = Resolve-Tool $e.Tool -Optional
+            if (-not $exe -and $script:Config.HideUnavailable) { continue }
+        }
+        @{ Entry = $e; Icon = $(if ($exe) { "$exe,0" } else { '' }) }
+    }
+
+    # Classic menu (all Windows versions; "Show more options" on Windows 11).
     foreach ($menu in 'File', 'Dir', 'Background') {
         $scope = if ($menu -eq 'File') { 'File' } else { 'Dir' }
-        $i = 0; $lastGroup = $null; $titles = @()
-        foreach ($e in $Catalog) {
+        $i = 0; $lastGroup = $null
+        foreach ($s in $shown) {
+            $e = $s.Entry
             if ($e.Scope -notcontains $scope) { continue }
-            if (@($script:Config.Disabled) -contains $e.Id) { continue }
-            $exe = $null
-            if ($e.Tool) {
-                $exe = Resolve-Tool $e.Tool -Optional
-                if (-not $exe -and $script:Config.HideUnavailable) { continue }
-            }
             $i++
             $key = '{0}\{1}\{2}\shell\{3:D2}_{4}' -f $RegClasses, $MenuStore, $menu, $i, $e.Id
             $vals = @{ MUIVerb = $e.Title; MultiSelectModel = 'Single' }
-            if ($exe) { $vals.Icon = "$exe,0" }
+            if ($s.Icon) { $vals.Icon = $s.Icon }
             if ($null -ne $lastGroup -and $e.Group -ne $lastGroup) { $vals.CommandFlags = 0x20 }   # ECF_SEPARATORBEFORE
-            if ($menu -eq 'File' -and $e.Match -and $script:Config.FilterByFileType) { $vals.AppliesTo = $e.Match }
+            if ($menu -eq 'File' -and $e.Match -and $script:Config.FilterByFileType) { $vals.AppliesTo = ConvertTo-Aqs $e.Match }
             $lastGroup = $e.Group
-
-            $style = if ($e.Hidden) { ' -WindowStyle Hidden' } else { '' }
-            $cmd = '"{0}" -NoProfile -ExecutionPolicy Bypass{1} -File "{2}" -Action {3} -Path "{4}"' -f $psExe, $style, $scriptPath, $e.Id, $placeholders[$menu]
             Set-RegValues $key $vals
-            Set-RegValues "$key\command" @{ '' = $cmd }
-            $titles += $e.Title
+            Set-RegValues "$key\command" @{ '' = (& $command $e $placeholders[$menu]) }
         }
-        Write-Ok ("{0,-10} menu: {1} item(s)" -f $menu, $titles.Count)
+        Write-Ok ("{0,-10} menu: {1} item(s)" -f $menu, $i)
     }
 
-    foreach ($r in $MenuRoots) {
+    # menu.json for the Windows 11 extension (ForensicAidShell.dll reads it on every change).
+    $lastGroup = $null
+    $items = foreach ($s in $shown) {
+        $e = $s.Entry
+        $m = if ($e.Match -and $script:Config.FilterByFileType) { $e.Match } else { FileMatch }
+        $scopes = @()
+        if ($e.Scope -contains 'File') { $scopes += 'File' }
+        if ($e.Scope -contains 'Dir') { $scopes += 'Dir', 'Background' }
+        [ordered]@{
+            id = $e.Id; title = $e.Title; icon = $s.Icon; scopes = $scopes; group = [int]$e.Group
+            ext = @($m.Ext); names = @($m.Name); prefixes = @($m.Prefix); excludeNames = @($m.Exclude)
+            separatorBefore = ($null -ne $lastGroup -and $e.Group -ne $lastGroup); hidden = [bool]$e.Hidden
+            command = (& $command $e '%1')
+        }
+        $lastGroup = $e.Group
+    }
+    $json = [ordered]@{ version = 1; title = 'ForensicAid'; icon = $icon; items = @($items) } | ConvertTo-Json -Depth 5
+    [void][IO.Directory]::CreateDirectory($InstallDir)
+    [IO.File]::WriteAllText($MenuJson, $json, (New-Object Text.UTF8Encoding($false)))
+
+    # With the Windows 11 package registered, its verb shows in both the new and the classic menu, so the
+    # classic verbs would appear twice - keep only drive icons, which packaged verbs cannot cover.
+    $roots = $MenuRoots
+    if (Test-ShellExtension) {
+        $roots = @($MenuRoots | Where-Object { $_.Key -like 'Drive\*' })
+        Write-Ok 'Windows 11 package registered - classic entries only for drive icons.'
+    }
+    foreach ($r in $roots) {
         Set-RegValues "$RegClasses\$($r.Key)" @{
             MUIVerb                = 'ForensicAid'
             Icon                   = $icon
@@ -1162,6 +1307,90 @@ function Start-Tray {
     Write-Ok 'Tray icon started (also at logon - untick "Start with Windows" in its menu to stop that).'
 }
 
+function Test-Win11 { return [Environment]::OSVersion.Version.Build -ge 22000 }
+
+function Test-ShellExtension {
+    if ($env:FORENSICAID_REGROOT -or -not (Test-Win11) -or -not $script:Config.Win11Menu) { return $false }
+    try { return [bool](Get-AppxPackage -Name $ShellPackage -ErrorAction SilentlyContinue) } catch { return $false }
+}
+
+function Write-MenuHint {
+    if (-not (Test-Win11)) { return }
+    if (Test-ShellExtension) { Write-Info 'Windows 11: ForensicAid is in the top-level menu (drive icons: "Show more options").' }
+    else { Write-Info 'Windows 11: the menu is under "Show more options" (or Shift+Right-click).' }
+}
+
+# A DLL loaded by a running dllhost cannot be overwritten, but it can be renamed out of the way.
+function Copy-InUseFile([string]$Source, [string]$Destination) {
+    try {
+        Copy-Item -LiteralPath $Source -Destination $Destination -Force
+    } catch {
+        Move-Item -LiteralPath $Destination -Destination ('{0}.{1:yyyyMMddHHmmss}.old' -f $Destination, (Get-Date)) -Force
+        Copy-Item -LiteralPath $Source -Destination $Destination -Force
+    }
+}
+
+# Windows 11 top-level menu: sparse package (win11\dist, built by win11\build.ps1) whose COM server
+# ForensicAidShell.dll lives in the install folder and reads menu.json.
+function Install-ShellExtension([string]$SourceDir) {
+    if ($env:FORENSICAID_REGROOT -or -not (Test-Win11)) { return }
+    if (-not $script:Config.Win11Menu) { Write-Info 'Windows 11 top-level menu disabled in the config (Win11Menu).'; return }
+    $dist = Join-Path $SourceDir 'win11\dist'
+    $msix = Join-Path $dist 'ForensicAid-Shell.msix'
+    $cer = Join-Path $dist 'ForensicAid-Shell.cer'
+    if (-not ([IO.File]::Exists($msix) -and [IO.File]::Exists($cer) -and [IO.File]::Exists((Join-Path $dist 'ForensicAidShell.dll')))) {
+        Write-Warn 'Windows 11 top-level menu not built - run win11\build.ps1 (needs Visual Studio), then install.cmd again.'
+        return
+    }
+
+    Get-ChildItem -LiteralPath $InstallDir -Filter '*.old' -File | Remove-Item -Force -ErrorAction SilentlyContinue
+    foreach ($f in 'ForensicAidShell.dll', 'ForensicAidStub.exe') { Copy-InUseFile (Join-Path $dist $f) (Join-Path $InstallDir $f) }
+
+    $thumb = (New-Object Security.Cryptography.X509Certificates.X509Certificate2 $cer).Thumbprint
+    $isTrusted = { [bool](Get-ChildItem Cert:\LocalMachine\TrustedPeople | Where-Object { $_.Thumbprint -eq $thumb }) }
+    if (-not (& $isTrusted)) {
+        Write-Info 'Windows only registers signed packages: the ForensicAid certificate must be trusted (one UAC prompt).'
+        $cmd = "Import-Certificate -FilePath '{0}' -CertStoreLocation Cert:\LocalMachine\TrustedPeople | Out-Null" -f $cer.Replace("'", "''")
+        $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cmd))
+        try {
+            $null = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -Verb RunAs -Wait -PassThru -ArgumentList "-NoProfile -EncodedCommand $enc"
+        } catch { }
+        if (-not (& $isTrusted)) { Write-Warn 'Certificate not trusted (UAC refused?) - Windows 11 top-level menu skipped, classic menu works.'; return }
+    }
+
+    # Update in place, never remove first: removing a package whose menu handler Explorer holds can hang.
+    $want = ([xml](Get-Content -LiteralPath (Join-Path $dist 'AppxManifest.xml') -Raw)).Package.Identity.Version
+    $have = Get-AppxPackage -Name $ShellPackage
+    if ($have -and [string]$have.Version -eq $want -and [string]$have.Status -eq 'Ok') {
+        Write-Ok "Windows 11 top-level menu already registered (version $want)."
+        return
+    }
+    try {
+        Add-AppxPackage -Path $msix -ExternalLocation $InstallDir -ForceApplicationShutdown -ForceUpdateFromAnyVersion
+    } catch {
+        Write-Warn "Registering the Windows 11 menu failed: $($_.Exception.Message)"
+        return
+    }
+    Write-Ok "Windows 11 top-level menu registered (version $want)."
+    if ((Read-Host '  Restart Explorer now so the new menu shows up? Open Explorer windows will close. [y/N]') -match '^[yYtT]') {
+        Stop-Process -Name explorer -Force
+        Start-Sleep -Seconds 3
+        if (-not (Get-Process -Name explorer -ErrorAction SilentlyContinue)) { Start-Process explorer.exe }
+    }
+}
+
+function Uninstall-ShellExtension {
+    if ($env:FORENSICAID_REGROOT -or -not (Test-Win11)) { return }
+    $pkg = Get-AppxPackage -Name $ShellPackage
+    if ($pkg) { $pkg | Remove-AppxPackage; Write-Ok 'Windows 11 top-level menu removed.' }
+    foreach ($f in 'ForensicAidShell.dll', 'ForensicAidStub.exe') {
+        $p = Join-Path $InstallDir $f
+        if ([IO.File]::Exists($p)) {
+            try { Remove-Item -LiteralPath $p -Force } catch { Move-Item -LiteralPath $p -Destination "$p.old" -Force }   # still loaded: goes on next install
+        }
+    }
+}
+
 function Install-ForensicAid {
     Write-Host "ForensicAid $Version - installing for $env:USERNAME" -ForegroundColor White
     # Before anything is changed: older versions must go first, otherwise stop here untouched.
@@ -1188,14 +1417,14 @@ function Install-ForensicAid {
     Get-ChildItem -LiteralPath $InstallDir -File | Unblock-File
     Write-Ok "Files installed to $InstallDir"
 
-    Register-Menu
+    $script:Config = Import-Config
+    Install-ShellExtension $src
+    Register-Menu   # after the package: decides which classic entries are still needed
     if ($withTray) { Start-Tray } else { Write-Info 'Test mode (FORENSICAID_REGROOT): tray icon not started or added to autostart.' }
     Show-ToolTable
     Write-Host ''
     Write-Info "Edit tool paths in $ConfigFile and use ForensicAid > Refresh menu."
-    if ([Environment]::OSVersion.Version.Build -ge 22000) {
-        Write-Info 'Windows 11: the menu is under "Show more options" (or Shift+Right-click).'
-    }
+    Write-MenuHint
 }
 
 function Uninstall-ForensicAid {
@@ -1204,10 +1433,11 @@ function Uninstall-ForensicAid {
         $k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($RunKey, $true)
         if ($k) { try { $k.DeleteValue('ForensicAidTray', $false) } finally { $k.Close() } }
     }
+    Uninstall-ShellExtension
     Remove-Menu
     Send-ShellRefresh
     Write-Ok 'Context menu removed.'
-    foreach ($f in 'ForensicAid.ps1', 'ForensicAidTray.ps1', 'icon.ico', 'tools.cache.json') {
+    foreach ($f in 'ForensicAid.ps1', 'ForensicAidTray.ps1', 'icon.ico', 'tools.cache.json', 'menu.json') {
         $p = Join-Path $InstallDir $f
         if ([IO.File]::Exists($p)) { Remove-Item -LiteralPath $p -Force }
     }

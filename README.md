@@ -19,6 +19,7 @@ Author: Mateusz Nowicki aka Hannon. Version 1.0.0.
 | Event logs: EvtxECmd | `.evtx`, folder | EvtxECmd |
 | NTFS | `$MFT`, `$J`, `$Boot`, `$SDS`, `$I30` (`$J` resolves paths through a `$MFT` found nearby) | MFTECmd |
 | Prefetch / LNK / Jump lists / Recycle Bin | `.pf`, `.lnk`, `*Destinations-ms`, `$I*`, folder | PECmd / LECmd / JLECmd / RBCmd |
+| RDP bitmap cache | `Cache000?.bin`, `bcache*.bmc`, folder | built-in: every tile as PNG + a collage per cache file |
 | Amcache / ShimCache | `Amcache.hve` / `SYSTEM` | AmcacheParser / AppCompatCacheParser |
 | Registry (batch) | hives, folder | RECmd with `Kroll_Batch.reb` |
 | ShellBags | folder | SBECmd |
@@ -51,9 +52,22 @@ File items only show for matching files. Items whose tool was not found are hidd
 3. The installer copies the files to `%LOCALAPPDATA%\ForensicAid`, finds your tools, registers the menu and starts the tray icon.
 4. If tools are missing, open **Edit configuration**, either from the tray or the menu. Add your tool folders to `ToolRoots`, or set exact paths under `Tools`, then use **Refresh menu**.
 
-On Windows 11 the menu is under **Show more options** (or Shift+right-click). Getting it into the new top-level menu needs a packaged shell extension, which is planned.
-
 Uninstall with `uninstall.cmd`. It removes the menu, the tray icon and its autostart. Your config and history are kept.
+
+### Windows 11 top-level menu
+
+Windows 11 shows classic menu entries only under **Show more options**. To put **ForensicAid** in the new top-level menu, ForensicAid includes a native shell extension in `win11/`. It is a C++ `IExplorerCommand` DLL registered through a signed sparse package. It has no logic of its own: it reads `menu.json`, which `Register-Menu` writes, so tray toggles apply to both menus.
+
+1. Build it once with `win11\build.ps1`. This needs Visual Studio with the C++ workload and the Windows SDK. The script creates a self-signed `CN=ForensicAid` certificate in your user store and signs the package with it.
+2. Run `install.cmd`. On Windows 11 it also:
+   - copies the DLL;
+   - asks for one UAC confirmation so the certificate is trusted (`LocalMachine\TrustedPeople`);
+   - registers the package and offers to restart Explorer.
+   If you refuse UAC, only the classic menu is installed.
+
+Windows does not allow new-menu entries on drive icons, so a right-click on a drive itself still uses **Show more options**. Folders and files on that drive get the new menu. Set `Win11Menu = $false` in the config to skip all this. `uninstall.cmd` removes the package. The certificate stays trusted until you delete it in `certlm.msc` under *Trusted People*.
+
+To test the DLL without installing it, run `win11\test\Test-Harness.ps1`.
 
 ## Tray icon
 
@@ -88,7 +102,7 @@ Double-click the icon to open the last results.
 
 ## Planned
 
-- Windows 11 top-level context menu (`IExplorerCommand` sparse package).
-- KAPE integration, RDP bitmap cache parser.
+- KAPE integration.
+- RDP cache: decoding RLE-compressed tiles of old `bcache2x.bmc` files (currently counted and skipped).
 
 **No guarantees.** Use it on your own responsibility, and work on copies of evidence when in doubt.

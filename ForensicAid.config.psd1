@@ -51,4 +51,5 @@
     HideUnavailable  = $true       # hide items whose tool was not found
     Disabled         = @()         # action ids to hide, e.g. @('to-raw', 'triage')
     EnableLogging    = $true       # history.log in the install folder
+    Win11Menu        = $true       # Windows 11: also add ForensicAid to the top-level menu (needs win11\build.ps1 output)
 }
