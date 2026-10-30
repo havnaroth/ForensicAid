@@ -118,6 +118,7 @@ ForensicAid is installed in `%LOCALAPPDATA%\ForensicAid`. It holds the scripts, 
 
 ## Planned, in more detail
 
+- **Settings window:** a GUI instead of editing `ForensicAid.config.psd1` by hand. It would cover tool paths with a version and status for each tool, buttons to browse and to find tools on this PC, Chainsaw rules, the output folder and the menu items. It would open from the tray icon and from **Edit configuration**.
 - **Tool download:** download only the tools the PC scan did not find. When a tool on disk is older than the newest release, ask whether to update it.
 - **KAPE integration.**
 - **Antivirus quarantine:** [maldump](https://github.com/NUKIB/maldump) extracts quarantined files and their metadata from Windows Defender and other antivirus products.
