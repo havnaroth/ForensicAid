@@ -79,6 +79,7 @@ $ToolFiles = [ordered]@{
     TimelineExplorer     = @('TimelineExplorer.exe')
     Chainsaw             = @('chainsaw.exe', 'chainsaw_x86_64-pc-windows-msvc.exe')
     QemuImg              = @('qemu-img.exe')
+    RdpCacheStitcher     = @('RdpCacheStitcher.exe')
 }
 
 $Defaults = @{
@@ -775,17 +776,23 @@ function Invoke-ToRaw($c) {
 # UInt16 width, UInt16 height, width*height*4 bytes BGRA top-down) and the older bcache*.bmc (20-byte
 # tile header: keys, width, height, length, flags; bottom-up, 16/24/32 bpp; RLE-compressed tiles are
 # counted but not decoded). Every tile is saved as PNG, plus a collage per cache file for quick review.
-function Export-RdpCacheFile([string]$File, [string]$OutDir) {
+# With -BmpDir the tiles are also written as BMP, one folder per cache file - the only input
+# RdpCacheStitcher reads (*.bmp, same size, alphabetical order = order in the cache file).
+function Export-RdpCacheFile([string]$File, [string]$OutDir, [string]$BmpDir) {
     Add-Type -AssemblyName System.Drawing
     $data = [IO.File]::ReadAllBytes($File)   # mstsc keeps each cache file around 100 MB at most
     $name = Get-SafeName ([IO.Path]::GetFileName($File))
     $isBin = $data.Length -ge 12 -and [Text.Encoding]::ASCII.GetString($data, 0, 7) -eq 'RDP8bmp'
     $isBmc = [IO.Path]::GetExtension($File) -ieq '.bmc'
-    $result = [pscustomobject]@{ File = $File; Format = $(if ($isBin) { 'RDP8 .bin' } elseif ($isBmc) { 'bmc' } else { 'unknown' }); Tiles = 0; Skipped = 0; Collage = '' }
+    $result = [pscustomobject]@{ File = $File; Format = $(if ($isBin) { 'RDP8 .bin' } elseif ($isBmc) { 'bmc' } else { 'unknown' }); Tiles = 0; Skipped = 0; Collage = ''; BmpDir = '' }
     if (-not ($isBin -or $isBmc)) { return $result }
 
     $tileDir = Join-Path $OutDir $name
     [void][IO.Directory]::CreateDirectory($tileDir)
+    if ($BmpDir) {
+        $result.BmpDir = Join-Path $BmpDir $name
+        [void][IO.Directory]::CreateDirectory($result.BmpDir)
+    }
     $bitmaps = [System.Collections.Generic.List[object]]::new()
     $pos = if ($isBin) { 12 } else { 0 }
     $sw = [Diagnostics.Stopwatch]::StartNew()
@@ -820,6 +827,7 @@ function Export-RdpCacheFile([string]$File, [string]$OutDir) {
         }
         $bmp.UnlockBits($bd)
         $bmp.Save((Join-Path $tileDir ('{0}_{1:D5}.png' -f $name, $bitmaps.Count)), [System.Drawing.Imaging.ImageFormat]::Png)
+        if ($BmpDir) { $bmp.Save((Join-Path $result.BmpDir ('{0}_{1:D5}.bmp' -f $name, $bitmaps.Count)), [System.Drawing.Imaging.ImageFormat]::Bmp) }
         $bitmaps.Add($bmp)
         if ($sw.ElapsedMilliseconds -gt 500) {
             Write-Progress -Activity "RDP cache $name" -Status "$($bitmaps.Count) tiles" -PercentComplete ([int](100 * $pos / $data.Length))
@@ -854,16 +862,64 @@ function Invoke-RdpCache($c) {
     } else { @($c.Path) }
     if (-not $files.Count) { throw "No RDP bitmap cache files (Cache*.bin, bcache*.bmc) under $($c.Path)" }
 
+    # BMP copies only when RdpCacheStitcher is there to use them (they double the disk usage).
+    $rcs = Resolve-Tool RdpCacheStitcher -Optional
+    $bmpRoot = if ($rcs) { Join-Path $c.Out 'for_RdpCacheStitcher' } else { '' }
     $results = foreach ($f in $files) {
         Write-Info "Parsing $f"
-        $r = Export-RdpCacheFile $f $c.Out
+        $r = Export-RdpCacheFile $f $c.Out $bmpRoot
         if ($r.Format -eq 'unknown') { Write-Warn "Not an RDP bitmap cache: $f" }
         else { Write-Ok ("{0}: {1} tiles{2}" -f [IO.Path]::GetFileName($f), $r.Tiles, $(if ($r.Skipped) { ", $($r.Skipped) compressed/unsupported skipped" } else { '' })) }
         Write-Log ("RDPCACHE `"{0}`" format={1} tiles={2} skipped={3}" -f $f, $r.Format, $r.Tiles, $r.Skipped)
         $r
     }
     $results | Export-Csv -LiteralPath (Join-Path $c.Out 'rdpcache_summary.csv') -NoTypeInformation -Encoding UTF8
-    if (-not ($results | Where-Object { $_.Tiles -gt 0 })) { $script:ToolFailures++; Write-Warn 'No tiles extracted.' }
+    $withTiles = @($results | Where-Object { $_.Tiles -gt 0 })
+    if (-not $withTiles.Count) { $script:ToolFailures++; Write-Warn 'No tiles extracted.'; return }
+    if (-not $rcs) { Write-Info 'Install RdpCacheStitcher (github.com/bsi-bund/RdpCacheStitcher) to rebuild whole screens from these tiles.'; return }
+    if (-not $c.InTriage -and (Read-Host '  Open the tiles in RdpCacheStitcher now? [y/N]') -match '^[yYtT]') {
+        Open-RdpCacheStitcher @($withTiles | ForEach-Object { $_.BmpDir })
+    }
+}
+
+# Folders under $Root that hold BMP tiles (the folder itself, or for_RdpCacheStitcher\* in results).
+function Find-RdpTileFolders([string]$Root) {
+    $hasBmp = { param($d) [bool](Get-ChildItem -LiteralPath $d -Filter '*.bmp' -File -ErrorAction SilentlyContinue | Select-Object -First 1) }
+    if (& $hasBmp $Root) { return @($Root) }
+    return @(Get-ChildItem -LiteralPath $Root -Recurse -Directory -Force -ErrorAction SilentlyContinue |
+             Where-Object { & $hasBmp $_.FullName } | ForEach-Object { $_.FullName })
+}
+
+# RdpCacheStitcher takes no command-line arguments (checked in its source), so start it, put the
+# tile folder on the clipboard and say where to paste it.
+function Open-RdpCacheStitcher([string[]]$Folders) {
+    $exe = Resolve-Tool RdpCacheStitcher
+    $Folders = @($Folders | Where-Object { $_ })
+    if (-not $Folders.Count) { throw 'No BMP tile folders. Run "RDP bitmap cache" on the cache files first.' }
+    $folder = $Folders[0]
+    if ($Folders.Count -gt 1) {
+        Write-Host '  Tile folders (one case each):'
+        for ($i = 0; $i -lt $Folders.Count; $i++) {
+            $n = @(Get-ChildItem -LiteralPath $Folders[$i] -Filter '*.bmp' -File).Count
+            Write-Host ('    [{0}] {1}  ({2} tiles)' -f ($i + 1), $Folders[$i], $n)
+        }
+        $answer = Read-Host ("  Which one? [1-{0}, Enter = 1]" -f $Folders.Count)
+        if ($answer -match '^\d+$' -and [int]$answer -ge 1 -and [int]$answer -le $Folders.Count) { $folder = $Folders[[int]$answer - 1] }
+    }
+
+    # RdpCacheStitcher needs the Visual C++ 2015-2022 runtime (x64).
+    $vc = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\X64' -ErrorAction SilentlyContinue
+    if (-not ($vc -and $vc.Installed -eq 1)) {
+        Write-Warn 'RdpCacheStitcher needs the Microsoft Visual C++ Redistributable (x64): https://aka.ms/vs/17/release/vc_redist.x64.exe'
+    }
+
+    try { Set-Clipboard -Value $folder } catch { }
+    Start-Process -FilePath $exe -WorkingDirectory ([IO.Path]::GetDirectoryName($exe))
+    Write-Log "RDPSTITCH `"$exe`" folder=$folder"
+    Write-Host ''
+    Write-Ok 'RdpCacheStitcher started. The tile folder is on the clipboard:'
+    Write-Host "      $folder"
+    Write-Host '  In RdpCacheStitcher: File > New case, paste the folder (Ctrl+V) into the folder box, then "Select Folder".'
 }
 
 function Invoke-Triage($c) {
@@ -921,7 +977,7 @@ function Invoke-Triage($c) {
             $results += [pscustomobject]@{ Step = $entry.Title; Input = $input_; Status = 'SKIPPED (tool missing)'; Seconds = 0 }
             continue
         }
-        $sub = @{ Action = $s.Id; Path = $s.Path; IsDir = $s.IsDir; Out = (Join-Path $c.Out ('{0:D2}_{1}' -f $i, $s.Id)) }
+        $sub = @{ Action = $s.Id; Path = $s.Path; IsDir = $s.IsDir; Out = (Join-Path $c.Out ('{0:D2}_{1}' -f $i, $s.Id)); InTriage = $true }
         [void][IO.Directory]::CreateDirectory($sub.Out)
         $before = $script:ToolFailures
         $sw = [Diagnostics.Stopwatch]::StartNew()
@@ -1216,6 +1272,8 @@ $Catalog = @(
     @{ Id = 'rdpcache'; Title = 'RDP bitmap cache (tiles + collage)'; Group = 3; Scope = 'File', 'Dir'
        Match = (FileMatch -Ext '.bmc' -Name 'Cache0000.bin', 'Cache0001.bin', 'Cache0002.bin', 'Cache0003.bin', 'Cache0004.bin')
        Run = { param($c) Invoke-RdpCache $c } }
+    @{ Id = 'rdp-stitch'; Title = 'Open tiles in RdpCacheStitcher'; Group = 3; Scope = 'Dir'; Tool = 'RdpCacheStitcher'; NoOutput = $true
+       Run = { param($c) Open-RdpCacheStitcher (Find-RdpTileFolders $c.Path) } }
     @{ Id = 'amcache'; Title = 'Amcache - AmcacheParser'; Group = 3; Scope = 'File'; Tool = 'AmcacheParser'
        Match = (FileMatch -Name 'Amcache.hve'); Run = { param($c) Invoke-Ez AmcacheParser $c -Extra (@('-i') + @(Get-HiveArgs $c.Path) + @(Get-EzTempArgs AmcacheParser $c)) } }
     @{ Id = 'shimcache'; Title = 'ShimCache - AppCompatCacheParser'; Group = 3; Scope = 'File'; Tool = 'AppCompatCacheParser'

@@ -39,7 +39,7 @@ The red fingerprint next to the clock lets you switch menu items on and off.
 - Automatic download of the tools.
 - KAPE integration.
 - Antivirus quarantine with [maldump](https://github.com/NUKIB/maldump).
-- Whole RDP screens with [RdpCacheStitcher](https://github.com/bsi-bund/rdpcachestitcher).
+- RdpCacheStitcher opening the tiles by itself. Today ForensicAid starts it and puts the folder on the clipboard.
 
 ---
 
