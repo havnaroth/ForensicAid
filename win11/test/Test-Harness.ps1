@@ -4,7 +4,7 @@ $dist = Join-Path (Split-Path $PSScriptRoot -Parent) 'dist'
 $t = Join-Path $env:TEMP 'fa_shell_test'
 if (Test-Path -LiteralPath $t) { Remove-Item -LiteralPath $t -Recurse -Force }
 $ev = Join-Path $t 'evidence'
-$pl = Join-Path $ev ([string][char]0x7A + [char]0x61 + [char]0x17C + [char]0xF3 + [char]0x142 + [char]0x107 + ' dir')   # "zażółć dir"
+$pl = Join-Path $ev ([string][char]0x7A + [char]0x61 + [char]0x17C + [char]0xF3 + [char]0x142 + [char]0x107 + ' dir')   # Polish letters + space
 New-Item -ItemType Directory -Path "$t\bin", $pl | Out-Null
 Copy-Item -LiteralPath "$dist\ForensicAidShell.dll" -Destination "$t\bin"
 foreach ($f in 'Amcache.hve', 'notes.txt', '$I30', '$IABC123.exe') { Set-Content -LiteralPath (Join-Path $ev $f) -Value x }
