@@ -1,153 +1,97 @@
 # ForensicAid
 
-Right-click a piece of evidence in Explorer and parse it with the right tool, with no command lines to type.
+**Right-click evidence, pick what to do, get the results.**
 
-ForensicAid adds a **ForensicAid** submenu for files, folders and folder backgrounds. On Windows 11 it appears in the top-level menu; drive icons keep it under *Show more options*. A tray icon lets you choose which items the menu shows.
-It wraps [Eric Zimmerman's tools](https://ericzimmerman.github.io), [Chainsaw](https://github.com/WithSecureLabs/chainsaw), `esentutl` and `qemu-img`, and has its own hashing and RDP bitmap cache parsing.
+ForensicAid puts forensic parsers into your right-click menu. Right-click a file such as `Amcache.hve`, `Security.evtx` or `disk.vhdx`, or a whole folder from KAPE, choose **ForensicAid**, and click the parser you want. It runs the right tool with the right options. The results end up in a `ForensicAid` folder next to the evidence.
 
-Author: Mateusz Nowicki aka Hannon. Version 1.0.0.
+| Right-click on a folder | Right-click on a disk image |
+|---|---|
+| ![ForensicAid menu on a folder](docs/menu-folder.png) | ![ForensicAid menu on a .vhdx file](docs/menu-disk-image.png) |
 
-## Features
+The menu only shows what makes sense for the item you clicked. On a `.vhdx` file you get the RAW conversion, and on a folder you get the folder parsers.
 
-| Menu item | Shown on | Uses |
-|---|---|---|
-| Hash (MD5/SHA1/SHA256) | any file (SHA256 copied to the clipboard), folder (`hashes.csv` of every file) | built-in |
-| Open in Timeline Explorer | `.csv`, `.xlsx` | Timeline Explorer |
-| Full triage (all parsers) | folder or drive, e.g. KAPE output or a mounted image | every parser below that applies |
-| Event logs: Chainsaw hunt | `.evtx`, folder | Chainsaw v2 (Sigma + Chainsaw rules) |
-| Event logs: EvtxECmd | `.evtx`, folder | EvtxECmd |
-| NTFS | `$MFT`, `$J`, `$Boot`, `$SDS`, `$I30` (`$J` resolves paths through a `$MFT` found nearby) | MFTECmd |
-| Prefetch / LNK / Jump lists / Recycle Bin | `.pf`, `.lnk`, `*Destinations-ms`, `$I*`, folder | PECmd / LECmd / JLECmd / RBCmd |
-| RDP bitmap cache | `Cache000?.bin`, `bcache*.bmc`, folder | built-in: every tile as PNG + a collage per cache file |
-| Amcache / ShimCache | `Amcache.hve` / `SYSTEM` | AmcacheParser / AppCompatCacheParser |
-| Registry (batch) | hives, folder | RECmd + `Kroll_Batch.reb` |
-| ShellBags | folder | SBECmd |
-| SRUM / UAL / Windows Timeline | `SRUDB.dat` / `*.mdb` / `ActivitiesCache.db`, folder | SrumECmd / SumECmd / WxTCmd |
-| Repair ESE database (copy) | `.edb`, `.mdb`, `SRUDB.dat`, `WebCacheV*.dat` | esentutl |
-| Disk image to RAW (.dd) | `.vhdx`, `.vhd`, `.vmdk`, `.qcow2`, `.vdi` | qemu-img |
-| Check tools / Edit configuration / Refresh menu | everywhere | built-in |
+## What you need
 
-File items only show for matching files. Items whose tool was not found are hidden. The menu works on one item at a time.
+- Windows 10 or 11. Nothing else needs to be installed: no Python, no admin account.
+- The forensic tools you want to use, in one folder, for example `C:\Tools`:
+  - [Eric Zimmerman's tools](https://ericzimmerman.github.io): run `Get-ZimmermanTools.ps1` into that folder;
+  - [Chainsaw v2](https://github.com/WithSecureLabs/chainsaw);
+  - `qemu-img`, only for disk image conversion.
 
-### Evidence handling
-
-- **Evidence is never modified.** ESE databases (SRUM, UAL) and `ActivitiesCache.db` are copied with their transaction logs or `-wal` files, and only the copy is parsed.
-  - A dirty database first gets a log replay (`esentutl /r`).
-  - Only if that fails does the copy get a hard repair (`esentutl /p`).
-- **Dirty registry hives** with no `.LOG1`/`.LOG2` next to them are detected and parsed with `--nl`, and you get a warning. This works for single hives and for folders.
-- **Results** go to `<evidence folder>\ForensicAid\<timestamp>_<action>_<name>\` together with `ForensicAid.log`, which records every command, exit code and duration.
-  - If that location is read-only, for example a mounted image, results go to `OutputRoot`.
-  - Our own output folders are skipped when a folder is scanned again.
-- **Full triage** indexes the folder once and runs every parser that applies, each into its own subfolder. It ends with `triage_summary.csv`. A step is marked as a warning when its tool exits with an error or produces no CSV, because most EZ tool versions exit with 0 even when they fail.
-
-## Requirements
-
-- Windows 10 or 11 with Windows PowerShell 5.1, which is built in. Python is not needed.
-- The tools you want to use:
-  - EZ tools: the easiest way is `Get-ZimmermanTools.ps1`, run into e.g. `C:\Tools\EZ`;
-  - Chainsaw **v2**, plus a Sigma rules folder if you want Sigma;
-  - Timeline Explorer;
-  - `qemu-img`.
-
-  Anything missing just hides its menu item.
-- For the Windows 11 top-level menu only, you also need Visual Studio with the C++ workload and the Windows 10/11 SDK. They are only used to build it once.
+  You don't need all of them. Missing tools just don't show in the menu.
 
 ## Install
 
-1. Clone the repository.
-2. **Windows 11 only, optional:** build the top-level menu with `powershell -ExecutionPolicy Bypass -File win11\build.ps1`. The build output is not stored in the repository, so do this on a machine with Visual Studio. Copy `win11\dist` to other machines.
-3. Run `install.cmd` as your normal user, not as administrator. The installer:
-   1. **Older versions:** looks for older ForensicAid menus and the Python *DFIR Toolbox* (`setup.py`).
-      - If it finds any, it lists them and asks for permission to remove them. Removing them is required.
-      - If you answer *no*, nothing is changed.
-      - If you answer *yes*, everything is first backed up (`.reg` exports and file copies) to `%LOCALAPPDATA%\ForensicAid\legacy_backup\`.
-      - Machine-wide leftovers (HKLM, `C:\ProgramData\DFIR_Toolbox`) need a UAC confirmation.
-   2. **Files and menu:** copies its files to `%LOCALAPPDATA%\ForensicAid`, finds your tools and registers the menu for your user only.
-   3. **Windows 11 menu:** if `win11\dist` exists, copies the shell extension and asks for a UAC confirmation once, so the package certificate is trusted. It then registers or updates the package and offers to restart Explorer.
-   4. **Tray icon:** starts it and adds it to autostart.
-4. If tools are missing, open **Edit configuration** from the tray or the menu. Add your tool folders to `ToolRoots`, or set exact paths under `Tools`, then use **Refresh menu**.
+1. Download or clone this repository.
+2. Double-click **`install.cmd`**.
+3. Answer the questions:
+   - If you have an older version, it asks to remove it. Say **y**. A backup is made first.
+   - On Windows 11 it may ask for **admin permission** once, so ForensicAid can appear in the main right-click menu. Say **yes**.
+4. Done. Right-click any evidence file or folder and look for **ForensicAid**.
 
-Run `install.cmd` again after pulling a new version. It keeps your config and only changes what changed.
+If your tools are not in `C:\Tools` or on your Desktop, right-click anything and choose **ForensicAid → Edit configuration**. Add your tools folder under `ToolRoots`, save the file, then choose **ForensicAid → Refresh menu**.
 
-**Uninstall:** run `uninstall.cmd`. It removes the menu, the Windows 11 package, the tray icon and its autostart. Your config, history and backups stay in `%LOCALAPPDATA%\ForensicAid`.
+To remove ForensicAid, double-click **`uninstall.cmd`**.
 
-## Windows 11 top-level menu
+## What it can do
 
-Windows 11 shows classic menu entries only under *Show more options*. To appear in the top-level menu, an entry must come from a packaged shell extension. `win11/` contains one:
-- a small C++ `IExplorerCommand` DLL, registered through a signed sparse package;
-- the package points at the DLL in `%LOCALAPPDATA%\ForensicAid`.
+| Menu item | Use it on | What you get |
+|---|---|---|
+| Hash | any file or folder | MD5 / SHA1 / SHA256. For a single file the SHA256 is copied to the clipboard. |
+| Full triage | a folder, e.g. a KAPE collection | every parser below that fits the folder, in one go |
+| Event logs (Chainsaw / EvtxECmd) | `.evtx` or a folder | Sigma detections and parsed event logs |
+| NTFS (MFTECmd) | `$MFT`, `$J`, ... | file system timeline |
+| Prefetch, LNK, Jump lists, Recycle Bin | `.pf`, `.lnk`, ... or a folder | program execution and file access |
+| RDP bitmap cache | `Cache0000.bin`, `bcache*.bmc` | screen fragments from RDP sessions, as images and a collage |
+| Amcache, ShimCache, Registry, ShellBags | registry hives or a folder | parsed registry artifacts |
+| SRUM, UAL, Windows Timeline | `SRUDB.dat`, `*.mdb`, `ActivitiesCache.db` | resource usage, logons and activity history |
+| Repair ESE database | `.edb`, `.mdb`, `.dat` | a repaired **copy** of the database |
+| Disk image to RAW | `.vhdx`, `.vhd`, `.vmdk`, ... | a `.dd` image |
+| Open in Timeline Explorer | `.csv` | opens the results for review |
 
-The DLL has no logic of its own. It reads `menu.json`, which ForensicAid writes every time the menu is registered. Items, file filters, icons and tray toggles are therefore the same in both menus.
-
-- **Certificate:** `win11\build.ps1` signs the package with a self-signed `CN=ForensicAid` certificate from your user store, and creates that certificate on the first build. Installing the package needs this certificate in `LocalMachine\TrustedPeople`, which is why there is one UAC prompt.
-- **Versions:** every build gets a new package version, and the installer updates the registered package in place.
-- **Drive icons:** Windows does not allow top-level entries on drive icons. Right-clicking a drive itself still uses *Show more options*. Folders and files on the drive get the top-level menu.
-- **No duplicates:** while the package is registered, the classic entries for files and folders are not registered, so the item does not show twice.
-- **Turning it off:** set `Win11Menu = $false` in the config to skip all of this.
-- **Testing:** `win11\test\Test-Harness.ps1` loads the DLL without installing it and shows what the menu would contain for test files.
+**Your evidence is never changed.** Databases are copied before they are parsed or repaired, and each result folder has a `ForensicAid.log` with every command that was run.
 
 ## Tray icon
 
-The fingerprint icon next to the clock gives you:
-- **Context menu items:** tick or untick each item, and both menus update in the background. These choices are stored in `menu.state.json`, so your config file is never rewritten.
-- **Run action...:** run any action on a file or folder picked in a dialog.
-- **Check tools**, **Edit configuration** and **Refresh menu**.
-- Shortcuts to the last results, the output folder, the history log and the install folder.
-- **Start with Windows**.
+After installing, a red fingerprint appears next to the clock. Right-click it to:
+- switch menu items on or off;
+- run any action on a file you pick;
+- open your last results.
 
-Double-click the icon to open the last results.
+## Windows 11
 
-## Configuration
+On Windows 11, ForensicAid appears directly in the right-click menu, not hidden under *Show more options*. For that, it needs a small extra component, which has to be built once with Visual Studio:
 
-`%LOCALAPPDATA%\ForensicAid\ForensicAid.config.psd1` is a commented PowerShell data file. `%VARIABLES%` in it are expanded. After editing it, use **Refresh menu**.
-
-| Setting | Meaning |
-|---|---|
-| `ToolRoots` | Folders searched recursively for tools. When several copies are found, the highest version wins, e.g. net9 over net6 or Chainsaw v2 over v1. |
-| `Tools` | Exact executable paths. These take priority over `ToolRoots`. |
-| `Chainsaw` | `SigmaRules`, `Mapping`, `Rules`, `ExtraArgs`. Empty values use the standard layout next to `chainsaw.exe`. |
-| `RECmdBatch` | Batch file for RECmd. When empty, `BatchExamples\Kroll_Batch.reb` is used. |
-| `OutputMode` / `OutputRoot` | `NextToEvidence` (default, falls back to `OutputRoot`) or always `OutputRoot`. |
-| `OpenOutputFolder` | Open the results in Explorer when an action finishes. |
-| `PauseOnExit` | `Always`, `OnError` or `Never`. |
-| `FilterByFileType` | Show file items only for matching files. |
-| `HideUnavailable` | Hide items whose tool was not found. |
-| `Disabled` | Action ids to hide, e.g. `@('to-raw')`. The tray adds its own toggles to this. |
-| `EnableLogging` | Write `history.log` in the install folder. |
-| `Win11Menu` | Install the Windows 11 top-level menu when the package has been built. |
-
-## Command line
-
-```powershell
-.\ForensicAid.ps1 -Action triage -Path 'E:\KAPE\C'   # any action id: hash, chainsaw, evtx, mft, registry, srum, rdpcache, to-raw, ...
-.\ForensicAid.ps1 -Action doctor                     # which tools and rules were found
-.\ForensicAid.ps1 -Install [-ResetConfig] [-Yes]     # -Yes = remove old versions without asking
-.\ForensicAid.ps1 -Uninstall
+```
+powershell -ExecutionPolicy Bypass -File win11\build.ps1
 ```
 
-## Repository layout
+Run `install.cmd` after building. If you skip this step, ForensicAid still works, but it stays under *Show more options*.
 
-| Path | What |
-|---|---|
-| `ForensicAid.ps1` | Installer, menu registration and every action, all in one script. |
-| `ForensicAidTray.ps1` | Tray icon. |
-| `ForensicAid.config.psd1` | Config template, copied on the first install. |
-| `install.cmd` / `uninstall.cmd` | Double-click wrappers. |
-| `icon.ico` | Menu, tray and package icon. |
-| `win11/` | Windows 11 shell extension: `src/` (DLL + stub exe), `package/` (manifest), `build.ps1`, `test/` (harness). |
+## If something goes wrong
 
-## Troubleshooting
+- **The menu item you want is missing:** choose **ForensicAid → Check tools**. It shows which tools were found and which were not.
+- **ForensicAid shows twice, or the icon looks old:** run `install.cmd` again and let it restart Explorer.
+- **The installer seems stuck on "Deployment operation progress":** wait a minute. If it still doesn't move, restart Explorer from Task Manager.
 
-- **The menu does not show up or still shows old items:** run **Check tools**, then **Refresh menu**. On Windows 11, restart Explorer after the first install of the package.
-- **ForensicAid shows twice:** run `install.cmd` again. This happens when the classic entries were registered before the Windows 11 package.
-- **The installer seems stuck on "Deployment operation progress ... Initialized":** Windows is waiting for Explorer to release the old package. Give it a minute. If it does not move on, restart Explorer from Task Manager.
-- **The old icon still shows:** Explorer caches icons. Restart Explorer.
-- **The Windows 11 menu was skipped:** the installer prints why, e.g. the package was not built or the UAC prompt was refused. The classic menu works either way.
-- **To remove the certificate after uninstalling:** open `certlm.msc` and delete `ForensicAid` under *Trusted People*. Delete it from `certmgr.msc` under *Personal* only if you no longer build the package.
+## For advanced users
+
+- Settings file: `%LOCALAPPDATA%\ForensicAid\ForensicAid.config.psd1`. Every option in it is explained by a comment.
+- Command line:
+
+  ```powershell
+  .\ForensicAid.ps1 -Action triage -Path 'E:\KAPE\C'   # any menu action by id
+  .\ForensicAid.ps1 -Action doctor                     # check tools
+  ```
+- Everything is in two PowerShell scripts: `ForensicAid.ps1` and the tray icon in `ForensicAidTray.ps1`. The Windows 11 component's source is in `win11/`.
 
 ## Planned
 
+- Automatic download of the tools ForensicAid supports by default: EZ tools, Chainsaw with Sigma rules, Timeline Explorer, qemu-img.
+- Before downloading, a quick scan of the disks for tools that are already there. ForensicAid links to an existing executable instead of downloading it again. If the version found differs from the newest one, it asks what to do: keep it, download the new one, or pick another copy.
 - KAPE integration.
-- RDP cache: decoding the RLE-compressed tiles of old `bcache2x.bmc` files. They are currently counted and skipped.
+- RDP cache: decoding the compressed tiles of old `bcache2x.bmc` files.
+
+---
 
 **No guarantees.** Use it on your own responsibility, and work on copies of evidence when in doubt.
