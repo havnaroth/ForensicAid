@@ -9,13 +9,20 @@
 | Event logs: Chainsaw / EvtxECmd | `.evtx` or a folder | Sigma detections and parsed event logs |
 | NTFS: MFTECmd | `$MFT`, `$J`, `$Boot`, `$SDS`, `$I30` | file system timeline |
 | Prefetch, LNK, Jump lists, Recycle Bin | `.pf`, `.lnk`, `*Destinations-ms`, `$I*` or a folder | program execution and file access |
-| RDP bitmap cache | `Cache0000.bin`, `bcache*.bmc` or a folder | every tile as a PNG, plus a collage per cache file |
+| RDP bitmap cache | `Cache0000.bin`, `bcache*.bmc` or a folder | every tile as a PNG, plus a collage per cache file. When RdpCacheStitcher is installed, the tiles are also saved as BMP and it offers to open them. |
+| Open tiles in RdpCacheStitcher | a results folder | starts [RdpCacheStitcher](https://github.com/bsi-bund/RdpCacheStitcher) to rebuild whole screens |
 | Amcache, ShimCache, Registry, ShellBags | registry hives or a folder | parsed registry artifacts (RECmd uses `Kroll_Batch.reb`) |
 | SRUM, UAL, Windows Timeline | `SRUDB.dat`, `*.mdb`, `ActivitiesCache.db` | resource usage, logons and activity history |
 | Repair ESE database | `.edb`, `.mdb`, `SRUDB.dat`, `WebCacheV*.dat` | a repaired **copy** of the database |
 | Disk image to RAW | `.vhdx`, `.vhd`, `.vmdk`, `.qcow2`, `.vdi` | a `.dd` image, made by qemu-img |
 | Open in Timeline Explorer | `.csv`, `.xlsx` | the file opened in Timeline Explorer |
 | Find tools / Check tools / Edit configuration / Refresh menu | everywhere | manage ForensicAid itself |
+
+### RdpCacheStitcher
+
+RdpCacheStitcher has no command-line options, so it cannot be told which folder to open. ForensicAid starts it and copies the tile folder to the clipboard. In RdpCacheStitcher, choose **File → New case**, paste the folder with Ctrl+V and click **Select Folder**.
+
+It reads only BMP tiles, so ForensicAid writes them to `for_RdpCacheStitcher\<cache file>\` in the results folder. RdpCacheStitcher also needs the [Visual C++ Redistributable (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe).
 
 ## How evidence is handled
 
@@ -115,5 +122,5 @@ ForensicAid is installed in `%LOCALAPPDATA%\ForensicAid`. It holds the scripts, 
 - **KAPE integration.**
 - **Antivirus quarantine:** [maldump](https://github.com/NUKIB/maldump) extracts quarantined files and their metadata from Windows Defender and other antivirus products.
 - **RDP cache:**
-  - [RdpCacheStitcher](https://github.com/bsi-bund/rdpcachestitcher), to rebuild whole screens from the tiles;
+  - opening the tile folder in RdpCacheStitcher automatically; this needs an upstream change so that it accepts a folder argument;
   - decoding the compressed tiles of old `bcache2x.bmc` files.
