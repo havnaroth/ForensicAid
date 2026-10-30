@@ -99,6 +99,7 @@ Run `install.cmd` after building. If you skip this step, ForensicAid still works
 
 - Automatic download of the tools ForensicAid supports by default: EZ tools, Chainsaw with Sigma rules, Timeline Explorer, qemu-img. Only the tools the PC scan did not find would be downloaded. If the version on disk is older than the newest release, ForensicAid would ask whether to update.
 - KAPE integration.
+- Antivirus quarantine: integration of [maldump](https://github.com/NUKIB/maldump), which extracts quarantined files and their metadata from Windows Defender and other antivirus products, on a mounted image or collected folder.
 - RDP cache: integration of [RdpCacheStitcher](https://github.com/bsi-bund/rdpcachestitcher), which rebuilds whole screens from the tiles, and decoding the compressed tiles of old `bcache2x.bmc` files.
 
 ---
