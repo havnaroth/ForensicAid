@@ -88,6 +88,7 @@ Run `install.cmd` after building. If you skip this step, ForensicAid still works
 ## Planned
 
 - Automatic download of the tools ForensicAid supports by default: EZ tools, Chainsaw with Sigma rules, Timeline Explorer, qemu-img.
+- Before downloading, a quick scan of the disks for tools that are already there. ForensicAid links to an existing executable instead of downloading it again. If the version found differs from the newest one, it asks what to do: keep it, download the new one, or pick another copy.
 - KAPE integration.
 - RDP cache: decoding the compressed tiles of old `bcache2x.bmc` files.
 
