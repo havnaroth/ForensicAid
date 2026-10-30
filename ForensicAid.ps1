@@ -23,7 +23,9 @@ param(
     [Parameter(ParameterSetName = 'Run')] [string] $Path,
     [Parameter(ParameterSetName = 'Install', Mandatory)] [switch] $Install,
     [Parameter(ParameterSetName = 'Install')] [switch] $ResetConfig,
-    [Parameter(ParameterSetName = 'Install')] [switch] $Yes,
+    [Parameter(ParameterSetName = 'Install')] [Parameter(ParameterSetName = 'ScanTools')] [switch] $Yes,
+    [Parameter(ParameterSetName = 'ScanTools', Mandatory)] [switch] $ScanTools,
+    [Parameter(ParameterSetName = 'ScanTools')] [switch] $Deep,
     [Parameter(ParameterSetName = 'RemoveLegacy', Mandatory)] [switch] $RemoveLegacy,
     [Parameter(ParameterSetName = 'RemoveLegacy', Mandatory)] [string] $BackupDir,
     [Parameter(ParameterSetName = 'Uninstall', Mandatory)] [switch] $Uninstall,
@@ -965,6 +967,192 @@ function Show-ToolTable {
     }
 }
 
+#region Tool scan
+
+# Folders where the tools probably are, cheapest first: folders seen in this user's execution history
+# (Program Compatibility Assistant store and MuiCache - both readable without admin; Prefetch and BAM
+# need admin and are not used) plus one or two levels up (the whole tool suite), the usual user
+# folders, ToolRoots, common install folders and top-level folders named like a tool collection.
+# -Deep scans whole fixed drives instead (minutes on large disks).
+function Get-ToolScanRoots([switch]$Deep) {
+    if ($env:FORENSICAID_SCANROOTS) { return @($env:FORENSICAID_SCANROOTS -split ';' | Where-Object { $_ }) }   # tests
+    $roots = [System.Collections.Generic.List[string]]::new()
+    $fixed = @([IO.DriveInfo]::GetDrives() | Where-Object { $_.DriveType -eq 'Fixed' -and $_.IsReady })
+    if ($Deep) { foreach ($d in $fixed) { $roots.Add($d.RootDirectory.FullName) }; return $roots }
+
+    $exeNames = @($ToolFiles.Values | ForEach-Object { $_ } | ForEach-Object { [regex]::Escape($_) }) -join '|'
+    $stop = @($env:USERPROFILE, $env:windir, $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramData) | Where-Object { $_ }
+    foreach ($k in 'Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Compatibility Assistant\Store',
+                   'Software\Classes\Local Settings\Software\Microsoft\Windows\Shell\MuiCache') {
+        $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($k)
+        if (-not $key) { continue }
+        foreach ($v in $key.GetValueNames()) {
+            if ($v -notmatch "(?i)^([A-Z]:\\.+?)\\($exeNames)") { continue }
+            $dir = $Matches[1]
+            for ($i = 0; $i -lt 3 -and $dir -and $dir.Length -gt 3 -and $stop -notcontains $dir; $i++) {
+                $roots.Add($dir)
+                $dir = [IO.Path]::GetDirectoryName($dir)
+            }
+        }
+        $key.Close()
+    }
+
+    foreach ($f in 'Desktop', 'MyDocuments') { $roots.Add([Environment]::GetFolderPath($f)) }
+    $roots.Add((Join-Path $env:USERPROFILE 'Downloads'))
+    foreach ($r in @($script:Config.ToolRoots)) { $roots.Add((Expand-PathValue $r)) }
+    $roots.Add((Join-Path $env:ProgramFiles 'qemu'))
+    $roots.Add((Join-Path $env:ProgramData 'chocolatey\bin'))
+    $roots.Add((Join-Path $env:USERPROFILE 'scoop'))
+    foreach ($d in $fixed) {
+        Get-ChildItem -LiteralPath $d.RootDirectory.FullName -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '(?i)tool|forensic|dfir|zimmerman|^ez|kape|chainsaw|^ir$|incident|triage' } |
+            ForEach-Object { $roots.Add($_.FullName) }
+    }
+
+    # Existing folders only, and no folder that sits inside another one on the list.
+    $unique = @{}   # case-insensitive keys; Sort-Object -Unique would also drop different paths of equal length
+    foreach ($r in $roots) { if ($r -and [IO.Directory]::Exists($r)) { $unique[[IO.Path]::GetFullPath($r).TrimEnd('\')] = $true } }
+    $kept = @()
+    foreach ($r in ($unique.Keys | Sort-Object Length)) {
+        if (-not ($kept | Where-Object { $r.StartsWith("$_\", [StringComparison]::OrdinalIgnoreCase) -or $r -ieq $_ })) { $kept += $r }
+    }
+    return $kept
+}
+
+function Find-ToolCandidates([string[]]$Roots) {
+    $wanted = @{}
+    foreach ($tool in $ToolFiles.Keys) { foreach ($f in $ToolFiles[$tool]) { $wanted[$f.ToLowerInvariant()] = $tool } }
+    $names = @($wanted.Keys)
+    $skip = @($env:TEMP, $InstallDir) | Where-Object { $_ } | ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\') + '\' }
+
+    $found = @{}
+    foreach ($root in $Roots) {
+        Write-Host "    $root" -ForegroundColor DarkGray
+        $ErrorActionPreference = 'Continue'
+        $hits = & where.exe /r $root @names 2>$null
+        $ErrorActionPreference = 'Stop'
+        foreach ($h in @($hits)) {
+            if (-not $h -or (Test-OwnOutput $h) -or $h -like '*\$Recycle.Bin\*') { continue }
+            if ($skip | Where-Object { $h.StartsWith($_, [StringComparison]::OrdinalIgnoreCase) }) { continue }
+            $tool = $wanted[[IO.Path]::GetFileName($h).ToLowerInvariant()]
+            if (-not $tool) { continue }
+            if (-not $found.ContainsKey($tool)) { $found[$tool] = [System.Collections.Generic.List[string]]::new() }
+            if (-not $found[$tool].Contains($h)) { $found[$tool].Add($h) }
+        }
+    }
+    return $found
+}
+
+function Get-ToolVersion([string]$Tool, [string]$Exe) {
+    if ($Tool -eq 'Chainsaw') { return Get-ChainsawVersion $Exe }
+    return Get-FileVersionSafe (Get-Item -LiteralPath $Exe)
+}
+
+# Writes Tools.<Name> = '<path>' into the user's config, keeping every comment and other setting.
+function Set-ConfigTools([hashtable]$Paths) {
+    if (-not [IO.File]::Exists($ConfigFile)) {
+        [void][IO.Directory]::CreateDirectory($InstallDir)
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'ForensicAid.config.psd1') -Destination $ConfigFile
+    }
+    $text = [IO.File]::ReadAllText($ConfigFile)
+    foreach ($tool in $Paths.Keys) {
+        $value = "'" + $Paths[$tool].Replace("'", "''") + "'"
+        $re = New-Object regex ("(?m)^(\s*$tool\s*=\s*)'[^']*'")
+        if ($re.IsMatch($text)) {
+            $text = $re.Replace($text, [Text.RegularExpressions.MatchEvaluator] { param($m) $m.Groups[1].Value + $value }, 1)
+        } elseif ($text -match '(?m)^\s*Tools\s*=\s*@\{[^\r\n]*\r?\n') {
+            $text = $text.Insert($Matches[0].Length + $text.IndexOf($Matches[0]), "        $tool = $value`r`n")
+        } else {
+            throw "No 'Tools = @{' section in $ConfigFile - add the paths by hand."
+        }
+    }
+    # Validate before replacing the user's file; keep the previous version next to it.
+    $tmp = "$ConfigFile.new"
+    [IO.File]::WriteAllText($tmp, $text, (New-Object Text.UTF8Encoding($true)))   # BOM: PS 5.1 reads BOM-less files as ANSI
+    try { $null = Import-PowerShellDataFile -LiteralPath $tmp } catch { Remove-Item -LiteralPath $tmp; throw "Updated config would be invalid, not saved: $($_.Exception.Message)" }
+    Copy-Item -LiteralPath $ConfigFile -Destination "$ConfigFile.bak" -Force
+    Move-Item -LiteralPath $tmp -Destination $ConfigFile -Force
+}
+
+function Invoke-ScanTools([switch]$Deep, [switch]$NoRegister) {
+    if (-not $script:Config) { $script:Config = Import-Config }
+    $roots = @(Get-ToolScanRoots -Deep:$Deep)
+    Write-Info ("Scanning {0} folder(s) for tools{1} ..." -f $roots.Count, $(if ($Deep) { ' (all fixed drives - this can take minutes)' } else { '' }))
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $found = Find-ToolCandidates $roots
+    Write-Info ("Scan finished in {0:n0}s." -f $sw.Elapsed.TotalSeconds)
+    Write-Host ''
+
+    # Candidates per tool, newest first.
+    $plan = [ordered]@{}
+    foreach ($tool in $ToolFiles.Keys) {
+        $current = Resolve-Tool $tool -Optional
+        $paths = @(@($found[$tool]) + @($current) | Where-Object { $_ -and [IO.File]::Exists($_) } | Sort-Object -Unique)
+        $cands = @($paths | ForEach-Object { [pscustomobject]@{ Path = $_; Version = (Get-ToolVersion $tool $_) } } |
+                   Sort-Object @{ Expression = 'Version'; Descending = $true }, @{ Expression = { $_.Path -ine $current } })
+        $plan[$tool] = @{
+            Cands      = $cands
+            Configured = Expand-PathValue $script:Config.Tools[$tool]
+            Current    = $current
+            Conflict   = @($cands | ForEach-Object { $_.Version } | Sort-Object -Unique).Count -gt 1
+        }
+    }
+
+    # Different versions of the same tool: ask once how to resolve them, not once per tool.
+    # newest = take the newest everywhere; keep = leave tools already set in the config alone; choose = ask per tool.
+    $conflicts = @($plan.Keys | Where-Object { $plan[$_].Conflict })
+    $mode = 'keep'
+    if ($conflicts.Count -and -not $Yes) {
+        Write-Info ("Different versions found for {0} tool(s): {1}" -f $conflicts.Count, ($conflicts -join ', '))
+        $answer = Read-Host '  Use the newest for all (Enter), choose for each tool (c), or keep what the config already uses (k)?'
+        $mode = if ($answer -match '^[cC]') { 'choose' } elseif ($answer -match '^[kK]') { 'keep' } else { 'newest' }
+        Write-Host ''
+    }
+
+    $changes = @{}
+    foreach ($tool in $plan.Keys) {
+        $p = $plan[$tool]
+        $cands = $p.Cands
+        $configured = $p.Configured
+        if (-not $cands.Count) { Write-Host ('  [-] {0,-22}not found' -f $tool) -ForegroundColor DarkYellow; continue }
+
+        $pick = $cands[0]
+        $inConfig = $cands | Where-Object { $_.Path -ieq $configured } | Select-Object -First 1
+        if ($p.Conflict -and $mode -eq 'keep' -and $inConfig) { $pick = $inConfig }
+        if ($p.Conflict -and $mode -eq 'choose') {
+            Write-Host ("  [?] {0} - different versions found:" -f $tool) -ForegroundColor Yellow
+            for ($i = 0; $i -lt $cands.Count; $i++) {
+                Write-Host ('      [{0}] {1,-14} {2}{3}' -f ($i + 1), $cands[$i].Version, $cands[$i].Path, $(if ($cands[$i].Path -ieq $p.Current) { '  (in use)' } else { '' }))
+            }
+            $answer = Read-Host ("      Use which? [1-{0}, Enter = 1 (newest), s = skip]" -f $cands.Count)
+            if ($answer -match '^[sS]') { continue }
+            if ($answer -match '^\d+$' -and [int]$answer -ge 1 -and [int]$answer -le $cands.Count) { $pick = $cands[[int]$answer - 1] }
+        }
+        $note = if ($cands.Count -gt 1) { " ($($cands.Count) copies)" } else { '' }
+        if ($pick.Path -ieq $configured) {
+            Write-Host ('  [=] {0,-22}{1}  v{2}{3}' -f $tool, $pick.Path, $pick.Version, $note) -ForegroundColor Green
+        } else {
+            $changes[$tool] = $pick.Path
+            Write-Host ('  [+] {0,-22}{1}  v{2}{3}' -f $tool, $pick.Path, $pick.Version, $note) -ForegroundColor Green
+        }
+    }
+
+    Write-Host ''
+    if ($changes.Count) {
+        Set-ConfigTools $changes
+        Write-Ok "Linked $($changes.Count) tool(s) in $ConfigFile (previous version: ForensicAid.config.psd1.bak)."
+        $script:Config = Import-Config
+        $script:ToolCache = $null
+        $null = Update-ToolCache
+        if (-not $NoRegister) { Register-Menu }
+    } else {
+        Write-Ok 'Config already points at the tools found - nothing to change.'
+    }
+    if (-not $Deep) { Write-Info 'Tools somewhere else? Run a full scan: ForensicAid.ps1 -ScanTools -Deep' }
+}
+
+#endregion
+
 function Show-Doctor {
     Write-Host "Version : $Version"
     Write-Host "Config  : $ConfigFile"
@@ -1051,6 +1239,8 @@ $Catalog = @(
     @{ Id = 'to-raw'; Title = 'Disk image to RAW (.dd) - qemu-img'; Group = 6; Scope = 'File'; Tool = 'QemuImg'
        Match = (FileMatch -Ext '.vhdx', '.vhd', '.vmdk', '.qcow2', '.vdi'); Run = { param($c) Invoke-ToRaw $c } }
 
+    @{ Id = 'scan-tools'; Title = 'Find tools on this PC'; Group = 9; Scope = 'File', 'Dir'; NoOutput = $true; NoPath = $true
+       Run = { param($c) Invoke-ScanTools } }
     @{ Id = 'doctor'; Title = 'Check tools'; Group = 9; Scope = 'File', 'Dir'; NoOutput = $true; NoPath = $true
        Run = { param($c) Show-Doctor } }
     @{ Id = 'config'; Title = 'Edit configuration'; Group = 9; Scope = 'File', 'Dir'; NoOutput = $true; NoPath = $true; Hidden = $true; NoPause = $true
@@ -1418,6 +1608,10 @@ function Install-ForensicAid {
     Write-Ok "Files installed to $InstallDir"
 
     $script:Config = Import-Config
+    $missing = @($ToolFiles.Keys | Where-Object { -not (Resolve-Tool $_ -Optional) })
+    if ($missing.Count -and ($Yes -or (Read-Host "  $($missing.Count) tool(s) not found yet. Look for them on this PC now (about a minute)? [Y/n]") -notmatch '^[nN]')) {
+        Invoke-ScanTools -NoRegister
+    }
     Install-ShellExtension $src
     Register-Menu   # after the package: decides which classic entries are still needed
     if ($withTray) { Start-Tray } else { Write-Info 'Test mode (FORENSICAID_REGROOT): tray icon not started or added to autostart.' }
@@ -1451,6 +1645,10 @@ function Uninstall-ForensicAid {
 #region Main
 
 if ($Install)   { Install-ForensicAid; return }
+if ($ScanTools) {
+    try { Invoke-ScanTools -Deep:$Deep } catch { Write-Err $_.Exception.Message; exit 1 }
+    return
+}
 if ($Uninstall) { Uninstall-ForensicAid; return }
 
 # Elevated helper started by Resolve-LegacyInstall: machine-wide leftovers only.
