@@ -1,0 +1,4 @@
+LIBRARY ForensicAidShell
+EXPORTS
+    DllGetClassObject PRIVATE
+    DllCanUnloadNow   PRIVATE
