@@ -1,6 +1,10 @@
-# ForensicAid
+<p align="center">
+  <img src="docs/icon.png" width="110" alt="ForensicAid fingerprint">
+</p>
 
-**Right-click evidence, pick what to do, get the results.**
+<h1 align="center">ForensicAid</h1>
+
+<p align="center"><b>Right-click evidence, pick what to do, get the results.</b></p>
 
 ForensicAid puts forensic parsers into your right-click menu. Right-click a file such as `Amcache.hve`, `Security.evtx` or `disk.vhdx`, or a whole folder from KAPE, choose **ForensicAid**, and click the parser you want. It runs the right tool with the right options. The results end up in a `ForensicAid` folder next to the evidence.
 
@@ -26,10 +30,11 @@ The menu only shows what makes sense for the item you clicked. On a `.vhdx` file
 2. Double-click **`install.cmd`**.
 3. Answer the questions:
    - If you have an older version, it asks to remove it. Say **y**. A backup is made first.
+   - If some tools are not found, it offers to **look for them on this PC**. Say **y**. It finds tools you already have, for example on your Desktop or in Downloads, and links them in the settings. If it finds several versions of a tool, it asks which one to use.
    - On Windows 11 it may ask for **admin permission** once, so ForensicAid can appear in the main right-click menu. Say **yes**.
 4. Done. Right-click any evidence file or folder and look for **ForensicAid**.
 
-If your tools are not in `C:\Tools` or on your Desktop, right-click anything and choose **ForensicAid → Edit configuration**. Add your tools folder under `ToolRoots`, save the file, then choose **ForensicAid → Refresh menu**.
+Added new tools later? Right-click anything and choose **ForensicAid → Find tools on this PC**.
 
 To remove ForensicAid, double-click **`uninstall.cmd`**.
 
@@ -70,7 +75,7 @@ Run `install.cmd` after building. If you skip this step, ForensicAid still works
 
 ## If something goes wrong
 
-- **The menu item you want is missing:** choose **ForensicAid → Check tools**. It shows which tools were found and which were not.
+- **The menu item you want is missing:** choose **ForensicAid → Find tools on this PC**. If the tool is still missing, run the full disk scan, `ForensicAid.ps1 -ScanTools -Deep`; it can take a few minutes. **Check tools** shows what is linked right now.
 - **ForensicAid shows twice, or the icon looks old:** run `install.cmd` again and let it restart Explorer.
 - **The installer seems stuck on "Deployment operation progress":** wait a minute. If it still doesn't move, restart Explorer from Task Manager.
 
@@ -82,15 +87,19 @@ Run `install.cmd` after building. If you skip this step, ForensicAid still works
   ```powershell
   .\ForensicAid.ps1 -Action triage -Path 'E:\KAPE\C'   # any menu action by id
   .\ForensicAid.ps1 -Action doctor                     # check tools
+  .\ForensicAid.ps1 -ScanTools [-Deep] [-Yes]          # find tools and link them in the settings
   ```
+- How the tool search works:
+  - The quick scan looks where tools usually are: folders from this user's program history (Program Compatibility Assistant, MuiCache), Desktop, Documents, Downloads, `ToolRoots`, and top-level folders named like *Tools*, *Forensic* or *KAPE*. It usually takes seconds.
+  - `-Deep` scans whole drives instead.
+  - Prefetch and BAM would need admin rights, so they are not used.
 - Everything is in two PowerShell scripts: `ForensicAid.ps1` and the tray icon in `ForensicAidTray.ps1`. The Windows 11 component's source is in `win11/`.
 
 ## Planned
 
-- Automatic download of the tools ForensicAid supports by default: EZ tools, Chainsaw with Sigma rules, Timeline Explorer, qemu-img.
-- Before downloading, a quick scan of the disks for tools that are already there. ForensicAid links to an existing executable instead of downloading it again. If the version found differs from the newest one, it asks what to do: keep it, download the new one, or pick another copy.
+- Automatic download of the tools ForensicAid supports by default: EZ tools, Chainsaw with Sigma rules, Timeline Explorer, qemu-img. Only the tools the PC scan did not find would be downloaded. If the version on disk is older than the newest release, ForensicAid would ask whether to update.
 - KAPE integration.
-- RDP cache: decoding the compressed tiles of old `bcache2x.bmc` files.
+- RDP cache: integration of [RdpCacheStitcher](https://github.com/bsi-bund/rdpcachestitcher), which rebuilds whole screens from the tiles, and decoding the compressed tiles of old `bcache2x.bmc` files.
 
 ---
 
