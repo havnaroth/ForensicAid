@@ -1111,6 +1111,12 @@ function Set-ConfigTools([hashtable]$Paths) {
         Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'ForensicAid.config.psd1') -Destination $ConfigFile
     }
     $text = [IO.File]::ReadAllText($ConfigFile)
+    if ($text -notmatch '(?m)^\s*Tools\s*=\s*@\{') {
+        # A trimmed-down config without a Tools section: add an empty one before the closing brace.
+        $last = $text.LastIndexOf('}')
+        if ($last -lt 0) { throw "$ConfigFile does not look like a PowerShell data file - add the paths by hand." }
+        $text = $text.Insert($last, "`r`n    Tools = @{`r`n    }`r`n")
+    }
     foreach ($tool in $Paths.Keys) {
         $value = "'" + $Paths[$tool].Replace("'", "''") + "'"
         $re = New-Object regex ("(?m)^(\s*$tool\s*=\s*)'[^']*'")
