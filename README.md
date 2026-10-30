@@ -36,6 +36,7 @@ The red fingerprint next to the clock lets you switch menu items on and off.
 
 ## Planned
 
+- A settings window instead of editing the config file by hand.
 - Automatic download of the tools.
 - KAPE integration.
 - Antivirus quarantine with [maldump](https://github.com/NUKIB/maldump).
