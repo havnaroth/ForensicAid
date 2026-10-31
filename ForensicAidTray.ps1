@@ -3,7 +3,8 @@
     ForensicAid tray icon - manage the toolbox and its Explorer menu from the notification area.
 
 .DESCRIPTION
-    Started at logon (HKCU\...\Run, value ForensicAidTray) by the installer:
+    Started at logon by a per-user scheduled task ('ForensicAidTray (<user>)') that the installer
+    registers; HKCU\...\Run (value ForensicAidTray) is only the fallback when the task cannot be created:
 
       powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File ForensicAidTray.ps1
 
@@ -38,7 +39,8 @@ $CacheFile  = Join-Path $InstallDir 'tools.cache.json'
 $IconFile   = Join-Path $PSScriptRoot 'icon.ico'
 $RunKey     = 'Software\Microsoft\Windows\CurrentVersion\Run'
 $RunValue   = 'ForensicAidTray'
-$TestMode   = [bool]$env:FORENSICAID_REGROOT   # test install: never touch the real Run key
+$TaskName   = 'ForensicAidTray ({0})' -f $env:USERNAME   # same name as in ForensicAid.ps1
+$TestMode   = [bool]$env:FORENSICAID_REGROOT   # test install: never touch the real autostart
 
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
@@ -90,6 +92,9 @@ function Get-Signature {
     $parts = foreach ($f in $ConfigFile, $Template, $StateFile, $CacheFile, $MainScript) {
         if ([IO.File]::Exists($f)) { [IO.File]::GetLastWriteTimeUtc($f).Ticks } else { 0 }
     }
+    # Custom menu items: saving one replaces its file, which also touches the folder.
+    $actions = Join-Path $InstallDir 'actions'
+    $parts += if ([IO.Directory]::Exists($actions)) { [IO.Directory]::GetLastWriteTimeUtc($actions).Ticks } else { 0 }
     return ($parts -join '|')
 }
 
@@ -380,6 +385,15 @@ function Open-OutputRoot {
     Open-Folder $root
 }
 
+function Open-Settings {
+    $settings = Join-Path $PSScriptRoot 'ForensicAidSettings.ps1'
+    if ([IO.File]::Exists($settings)) {
+        Start-Process -FilePath $PsExe -WindowStyle Hidden -ArgumentList ('-NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File "{0}"' -f $settings)
+    } else {
+        Edit-Config
+    }
+}
+
 function Edit-Config {
     if (-not [IO.File]::Exists($ConfigFile)) {
         if (-not [IO.File]::Exists($Template)) { Show-Balloon "Config not found: $ConfigFile" 'Warning'; return }
@@ -398,18 +412,53 @@ function Open-InstallDir {
     if ([IO.Directory]::Exists($InstallDir)) { Open-Folder $InstallDir } else { Show-Balloon "Not installed: $InstallDir" 'Warning' }
 }
 
+# Task Scheduler through COM: no ScheduledTasks module to load, so it is quick enough for the menu.
+function Get-TaskFolder {
+    $svc = New-Object -ComObject Schedule.Service
+    $svc.Connect()
+    return $svc.GetFolder('\')
+}
+
+# Same task as Register-TrayTask in ForensicAid.ps1 - keep the two in step.
+function Register-TrayTask([string]$Arguments) {
+    $user = [Security.SecurityElement]::Escape([Security.Principal.WindowsIdentity]::GetCurrent().Name)
+    $xml = @"
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>ForensicAid tray icon</Description></RegistrationInfo>
+  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>$user</UserId></LogonTrigger></Triggers>
+  <Principals><Principal id="Author"><UserId>$user</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>5</Priority>
+  </Settings>
+  <Actions Context="Author"><Exec><Command>$([Security.SecurityElement]::Escape($PsExe))</Command><Arguments>$([Security.SecurityElement]::Escape($Arguments))</Arguments></Exec></Actions>
+</Task>
+"@
+    [void](Get-TaskFolder).RegisterTask($TaskName, $xml, 6, $null, $null, 3)   # create or update, interactive token
+}
+
 function Test-Autostart {
+    try { [void](Get-TaskFolder).GetTask($TaskName); return $true } catch { }
     $k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($RunKey)
     if (-not $k) { return $false }
     try { return $null -ne $k.GetValue($RunValue) } finally { $k.Close() }
 }
 
 function Set-Autostart([bool]$On) {
+    $trayArgs = '-NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File "{0}"' -f $PSCommandPath
+    $useRunKey = $false
+    if ($On) {
+        try { Register-TrayTask $trayArgs } catch { $useRunKey = $true }   # e.g. Task Scheduler locked by policy
+    } else {
+        try { (Get-TaskFolder).DeleteTask($TaskName, 0) } catch { }   # throws when there is no task
+    }
     $k = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($RunKey)
     try {
-        if ($On) {
-            $cmd = '"{0}" -NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File "{1}"' -f $PsExe, $PSCommandPath
-            $k.SetValue($RunValue, $cmd, [Microsoft.Win32.RegistryValueKind]::String)
+        if ($useRunKey) {
+            $k.SetValue($RunValue, ('"{0}" {1}' -f $PsExe, $trayArgs), [Microsoft.Win32.RegistryValueKind]::String)
         } else {
             $k.DeleteValue($RunValue, $false)
         }
@@ -445,7 +494,7 @@ foreach ($m in $script:RunMenu, $script:ItemsMenu) { Add-Note $m '(loading...)';
 
 $items = [ordered]@{
     'Check tools'        = { try { Start-MainVisible @('-Action', 'doctor') } catch { Show-Balloon $_.Exception.Message 'Error' } }
-    'Edit configuration' = { try { Edit-Config } catch { Show-Balloon $_.Exception.Message 'Error' } }
+    'Settings...'        = { try { Open-Settings } catch { Show-Balloon $_.Exception.Message 'Error' } }
     'Refresh menu'       = { try { Start-Register } catch { Show-Balloon $_.Exception.Message 'Error' } }
     '-1'                 = $null
     'Open last results'  = { try { Open-LastResults } catch { Show-Balloon $_.Exception.Message 'Error' } }

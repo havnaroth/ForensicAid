@@ -26,7 +26,7 @@ ForensicAid finds the forensic tools you already have on the PC. A tool that is 
 - Puts the results in a `ForensicAid` folder next to the evidence.
 - **Never changes the evidence.**
 
-The red fingerprint next to the clock lets you switch menu items on and off.
+The red fingerprint next to the clock lets you switch menu items on and off. Tool paths, options and the exact arguments of each menu item are changed in **Settings** (in the tray icon menu and under **ForensicAid** in Explorer). You can also add your own programs to the menu there.
 
 ## Help
 

@@ -16,7 +16,7 @@
 | Repair ESE database | `.edb`, `.mdb`, `SRUDB.dat`, `WebCacheV*.dat` | a repaired **copy** of the database |
 | Disk image to RAW | `.vhdx`, `.vhd`, `.vmdk`, `.qcow2`, `.vdi` | a `.dd` image, made by qemu-img |
 | Open in Timeline Explorer | `.csv`, `.xlsx` | the file opened in Timeline Explorer |
-| Find tools / Check tools / Edit configuration / Refresh menu | everywhere | manage ForensicAid itself |
+| Find tools / Check tools / Settings / Refresh menu | everywhere | manage ForensicAid itself |
 
 ### RdpCacheStitcher
 
@@ -68,12 +68,51 @@ Without this, ForensicAid sits under *Show more options*. To get it into the mai
 
 Good to know:
 - A right-click on a **drive icon** always uses *Show more options*. Windows does not allow anything else there.
-- To skip the Windows 11 menu, set `Win11Menu = $false` in the settings.
+- To skip the Windows 11 menu, untick the Windows 11 option in **Settings > General**.
 - To remove the certificate after uninstalling, delete it in `certlm.msc` under *Trusted People*.
 
 ## Settings
 
-The settings file is `%LOCALAPPDATA%\ForensicAid\ForensicAid.config.psd1`. Every option in it is explained by a comment. After editing it, choose **ForensicAid → Refresh menu**.
+Open **Settings** from the tray icon or from **ForensicAid → Settings** in Explorer. The **General** tab holds where results go, the menu options, the tool folders and the rule files. The **Tools** tab shows each tool's path, version and status, with buttons to browse and to find tools on this PC. The **Menu items** tab is described below. **Save** writes only what you changed and refreshes the menu.
+
+### Menu items tab
+
+The tab lists every item. Untick one to hide it from the menu.
+
+**Edit...** (or a double-click) shows the arguments the item runs its program with, as a template with placeholders, and how the command would look on an example file. Change it and press **OK**; **Reset to default** brings back the built-in arguments. Changed items are shown in bold. For example, `{In} --csv {Out} --inc 4624,4625` makes EvtxECmd keep only logon events. The change also applies when the item runs as part of **Full triage**.
+
+| Placeholder | Becomes |
+|---|---|
+| `{Path}` | the file or folder you right-clicked |
+| `{In}` | `-f <file>` or `-d <folder>` (how the EZ tools take their input) |
+| `{Out}` | the results folder of this run |
+| `{Name}` | the file or folder name, without its path |
+| `{Dir}` | the folder you clicked, or the folder holding the file |
+
+Some items have extra placeholders that ForensicAid works out before the program runs, such as `{HiveArgs}` (adds `--nl` for a dirty hive without transaction logs) or `{Db}` (the repaired copy of an ESE database). The edit window lists them. Placeholders are quoted for you; inside quotes they are inserted as is, so `"{Out}\report"` works too.
+
+Hash, RDP bitmap cache, Repair ESE database, Full triage and Open tiles in RdpCacheStitcher run several steps rather than one program, so their arguments cannot be changed.
+
+**Add...** puts your own program in the menu: a title, the program, its arguments, whether it shows on files and/or folders, and which files it shows on (extensions, exact names or name prefixes). An optional **signature** (hex bytes at an offset, e.g. `4D5A` at 0 for an `.exe`) is checked before the program runs, so the item refuses files that only have the right name. Untick **Run in the ForensicAid console and wait** for programs with their own window.
+
+Each changed or added item is one file in `%LOCALAPPDATA%\ForensicAid\actions`. To share an item, copy its file into someone else's `actions` folder and use **Refresh menu**. A custom item file looks like this:
+
+```powershell
+@{
+    Title     = 'Foo cache - FooParser'
+    Program   = 'C:\Tools\FooParser.exe'          # %VARIABLES% are expanded
+    Command   = '-f {Path} --csv {Out}'
+    Scope     = @('File')                         # File and/or Dir
+    Ext       = @('.foo')                         # and/or Name = @(...), Prefix = @(...)
+    Signature = @{ Offset = 0; Hex = '464F4F00' } # optional
+    Output    = $true                             # create a results folder ({Out})
+    Wait      = $true                             # $false: start it and return
+}
+```
+
+A file named after a built-in item (for example `evtx.psd1`) holds only `Command` and replaces that item's arguments. **Check tools** lists the custom items and any item file that could not be read.
+
+The settings live in `%LOCALAPPDATA%\ForensicAid\ForensicAid.config.psd1`. You can still edit it by hand (**Edit the config file** in the window). Every option is explained by a comment, and the window keeps those comments. After editing the file by hand, choose **ForensicAid → Refresh menu**.
 
 | Setting | Meaning |
 |---|---|
@@ -110,7 +149,8 @@ ForensicAid is installed in `%LOCALAPPDATA%\ForensicAid`. It holds the scripts, 
 | Path | What |
 |---|---|
 | `ForensicAid.ps1` | installer, menu and every action |
-| `ForensicAidTray.ps1` | the icon next to the clock |
+| `ForensicAidTray.ps1` | the icon next to the clock; starts at logon through a per-user scheduled task |
+| `ForensicAidSettings.ps1` | the settings window |
 | `ForensicAid.config.psd1` | settings template |
 | `install.cmd` / `uninstall.cmd` | double-click install and uninstall |
 | `win11/` | Windows 11 menu component: C++ source, package, build script and tests |
