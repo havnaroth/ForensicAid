@@ -42,6 +42,8 @@
     # NextToEvidence: <evidence folder>\ForensicAid\<timestamp>_<action>_<name>
     #                 (falls back to OutputRoot when that location is read-only, e.g. a mounted image)
     # OutputRoot:     always write under OutputRoot
+    # EvidenceFolder: straight into the evidence's own folder, mixed with the evidence; a new run
+    #                 overwrites the last one (falls back to OutputRoot when the folder is read-only)
     OutputMode = 'NextToEvidence'
     OutputRoot = '%USERPROFILE%\ForensicAid_Output'
 

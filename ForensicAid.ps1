@@ -11,6 +11,8 @@
       ForensicAid.ps1 -Action doctor            show which tools were found
       ForensicAid.ps1 -ListActions              action list as JSON (used by the tray icon)
       ForensicAid.ps1 -RegisterMenu             re-register the menu without pausing (used by the tray icon)
+      ForensicAid.ps1 -SettingsInfo             config and tool status as JSON (used by the settings window)
+      ForensicAid.ps1 -SetConfig <file.json>    save settings into the config, then re-register the menu
 
     The tray icon (ForensicAidTray.ps1) is installed next to this script and started at logon.
 
@@ -30,7 +32,9 @@ param(
     [Parameter(ParameterSetName = 'RemoveLegacy', Mandatory)] [string] $BackupDir,
     [Parameter(ParameterSetName = 'Uninstall', Mandatory)] [switch] $Uninstall,
     [Parameter(ParameterSetName = 'ListActions', Mandatory)] [switch] $ListActions,
-    [Parameter(ParameterSetName = 'RegisterMenu', Mandatory)] [switch] $RegisterMenu
+    [Parameter(ParameterSetName = 'RegisterMenu', Mandatory)] [switch] $RegisterMenu,
+    [Parameter(ParameterSetName = 'SettingsInfo', Mandatory)] [switch] $SettingsInfo,
+    [Parameter(ParameterSetName = 'SetConfig', Mandatory)] [string] $SetConfig
 )
 
 $ErrorActionPreference = 'Stop'
@@ -46,8 +50,9 @@ $LastOutput = Join-Path $InstallDir 'last_output.txt'
 $TrayScript = Join-Path $InstallDir 'ForensicAidTray.ps1'
 $MenuJson   = Join-Path $InstallDir 'menu.json'   # read by the Windows 11 extension
 $ShellPackage = 'ForensicAid.ShellExtension'
-$RunKey     = 'Software\Microsoft\Windows\CurrentVersion\Run'
-$Esentutl   = Join-Path $env:windir 'System32\esentutl.exe'
+$RunKey     = 'Software\Microsoft\Windows\CurrentVersion\Run'   # autostart fallback (and older versions)
+$TaskName   = 'ForensicAidTray ({0})' -f $env:USERNAME   # per-user logon task that starts the tray
+$Esentutl  = Join-Path $env:windir 'System32\esentutl.exe'
 
 # Per-user classes (HKCU\Software\Classes) - merged into HKCR by Windows, no admin rights needed.
 $RegClasses = if ($env:FORENSICAID_REGROOT) { $env:FORENSICAID_REGROOT } else { 'Software\Classes' }
@@ -168,10 +173,16 @@ function Import-Config([switch]$DefaultsOnly) {
     return $cfg
 }
 
-function Open-Config {
+function Open-Config([switch]$File) {
     if (-not [IO.File]::Exists($ConfigFile)) {
         [void][IO.Directory]::CreateDirectory($InstallDir)
         Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'ForensicAid.config.psd1') -Destination $ConfigFile
+    }
+    $settings = Join-Path $PSScriptRoot 'ForensicAidSettings.ps1'
+    if (-not $File -and [IO.File]::Exists($settings)) {
+        Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -WindowStyle Hidden `
+            -ArgumentList ('-NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File "{0}"' -f $settings)
+        return
     }
     Start-Process notepad.exe -ArgumentList (ConvertTo-ArgumentString @($ConfigFile))
 }
@@ -333,10 +344,10 @@ function ConvertTo-ArgumentString([object[]]$Arguments) {
 
 # Runs a tool in this console window (keeps its colours and progress bars) and returns the exit code.
 function Invoke-Tool {
-    param([string]$Tool, [object[]]$Arguments, [string]$WorkDir, [switch]$AllowFailure)
+    param([string]$Tool, [object[]]$Arguments, [string]$WorkDir, [switch]$AllowFailure, [string]$ArgLine, [string]$Exe)
 
-    $exe = if ($Tool -eq 'esentutl') { $Esentutl } else { Resolve-Tool $Tool }
-    $argLine = ConvertTo-ArgumentString $Arguments
+    $exe = if ($Exe) { $Exe } elseif ($Tool -eq 'esentutl') { $Esentutl } else { Resolve-Tool $Tool }
+    $argLine = if ($PSBoundParameters.ContainsKey('ArgLine')) { $ArgLine } else { ConvertTo-ArgumentString $Arguments }
 
     Write-Host ''
     Write-Host ("> {0} {1}" -f [IO.Path]::GetFileName($exe), $argLine) -ForegroundColor DarkCyan
@@ -362,12 +373,100 @@ function Invoke-Tool {
     return $code
 }
 
-# EZ tools share the same CLI shape: -f <file> | -d <dir>, --csv <out>.
-function Invoke-Ez([string]$Tool, $c, [object[]]$Extra = @(), [switch]$Quiet) {
-    $in = if ($c.IsDir) { @('-d', $c.Path) } else { @('-f', $c.Path) }
-    $a = @($in) + @('--csv', $c.Out) + @($Extra)
-    if ($Quiet) { $a += '-q' }
-    $null = Invoke-Tool $Tool $a
+#endregion
+
+#region Command templates
+
+# Each menu item that runs one program has a command template: its arguments with {placeholders}.
+# The built-in template sits in the catalog; actions\<id>.psd1 can replace it (Settings > Menu items).
+# A placeholder outside quotes becomes ready-quoted arguments (a list adds several, an empty list none);
+# inside quotes ("{Out}\x") the raw value is inserted.
+function Expand-CommandTemplate([string]$Template, [hashtable]$Vars) {
+    $sb = New-Object Text.StringBuilder
+    $pos = 0
+    foreach ($m in [regex]::Matches($Template, '\{(\w+)\}')) {
+        $name = $m.Groups[1].Value
+        if (-not $Vars.ContainsKey($name)) { throw "Unknown placeholder {$name} in the command: $Template" }
+        [void]$sb.Append($Template, $pos, $m.Index - $pos)
+        $values = @($Vars[$name] | Where-Object { $null -ne $_ })
+        $inQuotes = (@($Template.Substring(0, $m.Index).ToCharArray() | Where-Object { $_ -eq '"' }).Count % 2) -eq 1
+        if ($inQuotes) {
+            $raw = ($values | ForEach-Object { [string]$_ }) -join ' '
+            $end = $m.Index + $m.Length
+            if ($end -lt $Template.Length -and $Template[$end] -eq '"') { $raw = $raw -replace '(\\+)$', '$1$1' }   # "E:\" would escape the quote
+            [void]$sb.Append($raw)
+        } elseif ($values.Count -eq 1 -and [string]$values[0] -eq '') {
+            [void]$sb.Append('""')
+        } else {
+            [void]$sb.Append((ConvertTo-ArgumentString $values))
+        }
+        $pos = $m.Index + $m.Length
+    }
+    [void]$sb.Append($Template.Substring($pos))
+    return $sb.ToString().Trim()
+}
+
+function Get-EntryCommand($Entry) {
+    if ($Entry.UserCommand) { return $Entry.UserCommand }
+    return $Entry.Command
+}
+
+# Placeholders every item has; items add their own (Vars in the catalog).
+function Get-BaseVars($c) {
+    return @{
+        Path = $c.Path
+        In   = $(if ($c.IsDir) { @('-d', $c.Path) } else { @('-f', $c.Path) })
+        Out  = [string]$c.Out
+        Name = [IO.Path]::GetFileName($c.Path.TrimEnd('\'))
+        Dir  = $(if ($c.IsDir) { $c.Path } else { [IO.Path]::GetDirectoryName($c.Path) })
+    }
+}
+
+# Runs one catalog item's program with its (possibly user-edited) command template.
+function Invoke-ItemCommand([string]$Id, [string]$Tool, $c, [hashtable]$Vars = @{}) {
+    $entry = $Catalog | Where-Object { $_.Id -eq $Id } | Select-Object -First 1
+    $all = Get-BaseVars $c
+    foreach ($k in $Vars.Keys) { $all[$k] = $Vars[$k] }
+    $null = Invoke-Tool $Tool -ArgLine (Expand-CommandTemplate (Get-EntryCommand $entry) $all)
+}
+
+# The program a menu item needs: a known tool, or the exe of a custom item. $null when missing.
+function Resolve-EntryExe($Entry) {
+    if ($Entry.Program) {
+        $p = Expand-PathValue $Entry.Program
+        if ($p -and [IO.File]::Exists($p)) { return $p }
+        return $null
+    }
+    if ($Entry.Tool) { return Resolve-Tool $Entry.Tool -Optional }
+    return $null
+}
+
+function Test-FileSignature([string]$File, $Signature) {
+    $want = [byte[]]@(($Signature.Hex -split '(..)' | Where-Object { $_ }) | ForEach-Object { [Convert]::ToByte($_, 16) })
+    $ok = $false
+    $fs = [IO.File]::Open($File, 'Open', 'Read', 'ReadWrite')
+    try {
+        if ($fs.Length -ge $Signature.Offset + $want.Length) {
+            $fs.Position = $Signature.Offset
+            $buf = New-Object byte[] $want.Length
+            $ok = ($fs.Read($buf, 0, $buf.Length) -eq $want.Length) -and ([BitConverter]::ToString($buf) -eq [BitConverter]::ToString($want))
+        }
+    } finally { $fs.Dispose() }
+    if (-not $ok) { throw ("This file does not have the expected signature ({0} at offset {1})." -f $Signature.Hex, $Signature.Offset) }
+}
+
+function Invoke-CustomItem($c) {
+    $e = $c.Entry
+    $exe = Resolve-EntryExe $e
+    if (-not $exe) { throw "Program not found: $($e.Program). Fix it in Settings > Menu items." }
+    if ($e.Signature -and -not $c.IsDir) { Test-FileSignature $c.Path $e.Signature }
+    $line = Expand-CommandTemplate $e.Command (Get-BaseVars $c)
+    if ($e.Wait) {
+        $null = Invoke-Tool $e.Title -Exe $exe -ArgLine $line
+    } else {
+        Write-Log "START `"$exe`" $line"
+        if ($line) { Start-Process -FilePath $exe -ArgumentList $line } else { Start-Process -FilePath $exe }
+    }
 }
 
 #endregion
@@ -384,8 +483,15 @@ function New-OutputDir([string]$EvidencePath, [string]$ActionId) {
     if (-not $leaf) { $leaf = 'drive_' + $EvidencePath.Substring(0, 1) }
     $name = '{0:yyyyMMdd_HHmmss}_{1}_{2}' -f (Get-Date), $ActionId, $leaf
 
+    # EvidenceFolder: straight into the folder of the evidence (or the folder clicked), no subfolder.
+    if ($script:Config.OutputMode -eq 'EvidenceFolder') {
+        $dir = if ([IO.Directory]::Exists($EvidencePath)) { $EvidencePath } else { [IO.Path]::GetDirectoryName($trimmed) }
+        if ($dir -and (Test-Writable $dir)) { return $dir }
+        Write-Warn "Cannot write to $dir - using the output folder instead."
+    }
+
     $bases = @()
-    if ($script:Config.OutputMode -ne 'OutputRoot') {
+    if ($script:Config.OutputMode -notin 'OutputRoot', 'EvidenceFolder') {
         $parent = [IO.Path]::GetDirectoryName($trimmed)
         if ($parent) { $bases += (Join-Path $parent 'ForensicAid') }
     }
@@ -404,6 +510,16 @@ function New-OutputDir([string]$EvidencePath, [string]$ActionId) {
     throw 'No writable output location. Check OutputRoot in the config.'
 }
 
+# The folder exists already, so creating it proves nothing - write and delete a probe file.
+function Test-Writable([string]$Dir) {
+    try {
+        $probe = Join-Path $Dir ('.forensicaid_{0}.tmp' -f [guid]::NewGuid().ToString('N'))
+        [IO.File]::WriteAllText($probe, '')
+        Remove-Item -LiteralPath $probe -Force
+        return $true
+    } catch { return $false }
+}
+
 function Initialize-Output($c) {
     if ($c.Out) { return }
     $c.Out = New-OutputDir $c.Path $c.Action
@@ -415,8 +531,9 @@ function Initialize-Output($c) {
 }
 
 # Our own results (and database copies in them) live in ...\ForensicAid\... - never treat them as evidence.
+# With OutputMode EvidenceFolder they sit among the evidence, so the working copies are told apart by name.
 function Test-OwnOutput([string]$FullName) {
-    return $FullName -like '*\ForensicAid\*'
+    return $FullName -like '*\ForensicAid\*' -or $FullName -like '*\_db_copy\*' -or $FullName -like '*\_temp\*'
 }
 
 function Find-FirstFile([string]$Root, [string]$Name, [string]$PreferDir) {
@@ -631,18 +748,17 @@ function Invoke-Chainsaw($c) {
     $set = Get-ChainsawRuleSet
     if (-not $set.Exe) { [void](Resolve-Tool Chainsaw) }
 
-    $a = @('hunt', $c.Path)
+    $a = @()
     $useSigma = $set.Sigma -and [IO.Directory]::Exists($set.Sigma)
     if ($useSigma) {
         if (-not [IO.File]::Exists($set.Mapping)) { throw "Sigma rules need a mapping file. Not found: $($set.Mapping) (set Chainsaw.Mapping in the config)." }
         $a += @('-s', $set.Sigma, '-m', $set.Mapping)
     }
     if ($set.Rules -and [IO.Directory]::Exists($set.Rules)) { $a += @('-r', $set.Rules) }
-    if ($a.Count -eq 2) { throw 'No Chainsaw or Sigma rules found. Set Chainsaw.SigmaRules / Chainsaw.Rules in the config.' }
+    if ($a.Count -eq 0) { throw 'No Chainsaw or Sigma rules found. Set Chainsaw.SigmaRules / Chainsaw.Rules in the config.' }
     if (-not $useSigma) { Write-Warn 'No Sigma rules configured - hunting with built-in Chainsaw rules only.' }
 
-    $a += @('--csv', '-o', (Join-Path $c.Out 'chainsaw')) + @($script:Config.Chainsaw.ExtraArgs)
-    $null = Invoke-Tool Chainsaw $a
+    Invoke-ItemCommand chainsaw Chainsaw $c @{ RuleArgs = $a; ExtraArgs = @($script:Config.Chainsaw.ExtraArgs) }
 }
 
 function Invoke-Mft($c) {
@@ -658,7 +774,7 @@ function Invoke-Mft($c) {
         if ($mft) { Write-Info "Using $mft to resolve paths."; $extra = @('-m', $mft) }
         else { Write-Warn "`$MFT not found next to $name - parent paths will not be resolved." }
     }
-    Invoke-Ez MFTECmd $c -Extra $extra
+    Invoke-ItemCommand mft MFTECmd $c @{ MftArg = $extra }
 }
 
 function Invoke-RECmd($c) {
@@ -666,22 +782,21 @@ function Invoke-RECmd($c) {
     $batch = Get-RECmdBatch $exe
     if (-not $batch -or -not [IO.File]::Exists($batch)) { throw 'No RECmd batch file found. Set RECmdBatch in the config (e.g. ...\RECmd\BatchExamples\Kroll_Batch.reb).' }
     Write-Info "Batch: $batch"
-    $extra = @('--bn', $batch)
     if (-not $c.IsDir) {
-        Invoke-Ez RECmd $c -Extra ($extra + @(Get-HiveArgs $c.Path))
+        Invoke-ItemCommand registry RECmd $c @{ Batch = $batch; HiveArgs = @(Get-HiveArgs $c.Path) }
         return
     }
 
     # -d mode fails (or silently skips) dirty hives without logs; parse those one by one with --nl.
     $nl = Find-HivesNeedingNl $c.Path
-    Invoke-Ez RECmd $c -Extra $extra
+    Invoke-ItemCommand registry RECmd $c @{ Batch = $batch; HiveArgs = @() }
     $i = 0
     foreach ($h in $nl) {
         $i++
         Write-Warn "Dirty hive without .LOG1/.LOG2, parsing separately with --nl: $h"
         $sub = @{ Path = $h; IsDir = $false; Out = (Join-Path $c.Out ('nl_{0:D2}_{1}' -f $i, (Get-SafeName ([IO.Path]::GetFileName($h))))) }
         [void][IO.Directory]::CreateDirectory($sub.Out)
-        Invoke-Ez RECmd $sub -Extra ($extra + @('--nl'))
+        Invoke-ItemCommand registry RECmd $sub @{ Batch = $batch; HiveArgs = @('--nl') }
     }
 }
 
@@ -690,7 +805,7 @@ function Invoke-SBECmd($c) {
     if ($nl.Count) {
         Write-Warn "SBECmd may skip these dirty hives that have no .LOG1/.LOG2 files:`n    $($nl -join "`n    ")"
     }
-    Invoke-Ez SBECmd $c
+    Invoke-ItemCommand shellbags SBECmd $c
 }
 
 function Invoke-Srum($c) {
@@ -710,9 +825,11 @@ function Invoke-Srum($c) {
 
     $work = Copy-EseSet @($db) (Join-Path $c.Out '_db_copy')
     Repair-EseDirectory $work
-    $a = @('-f', (Join-Path $work ([IO.Path]::GetFileName($db))), '--csv', $c.Out) + @(Get-EzTempArgs SrumECmd $c)
-    if ($software) { $a += @('-r', $software) }
-    $null = Invoke-Tool SrumECmd $a
+    Invoke-ItemCommand srum SrumECmd $c @{
+        Db          = (Join-Path $work ([IO.Path]::GetFileName($db)))
+        TempArgs    = @(Get-EzTempArgs SrumECmd $c)
+        SoftwareArg = $(if ($software) { @('-r', $software) } else { @() })
+    }
 }
 
 function Invoke-Sum($c) {
@@ -730,7 +847,7 @@ function Invoke-Sum($c) {
 
     $work = Copy-EseSet @($mdbs | ForEach-Object { $_.FullName }) (Join-Path $c.Out '_db_copy')
     Repair-EseDirectory $work
-    $null = Invoke-Tool SumECmd (@('-d', $work, '--csv', $c.Out) + @(Get-EzTempArgs SumECmd $c))
+    Invoke-ItemCommand ual SumECmd $c @{ Db = $work; TempArgs = @(Get-EzTempArgs SumECmd $c) }
 }
 
 # WxTCmd opens SQLite in place, which checkpoints -wal into the database: always parse a copy.
@@ -742,7 +859,7 @@ function Invoke-WxT($c) {
         $src = $c.Path + $suffix
         if ([IO.File]::Exists($src)) { Copy-Item -LiteralPath $src -Destination $work -Force }
     }
-    $null = Invoke-Tool WxTCmd (@('-f', (Join-Path $work ([IO.Path]::GetFileName($c.Path))), '--csv', $c.Out) + @(Get-EzTempArgs WxTCmd $c))
+    Invoke-ItemCommand activities WxTCmd $c @{ Db = (Join-Path $work ([IO.Path]::GetFileName($c.Path))); TempArgs = @(Get-EzTempArgs WxTCmd $c) }
 }
 
 function Invoke-EseRepair($c) {
@@ -768,7 +885,7 @@ function Invoke-ToRaw($c) {
             if ((Read-Host 'Continue anyway? [y/N]') -notmatch '^[yYtT]') { throw 'Cancelled by user.' }
         }
     } catch [System.ArgumentException] { }
-    $null = Invoke-Tool QemuImg @('convert', '-p', '-f', $info.format, '-O', 'raw', $c.Path, $dst)
+    Invoke-ItemCommand to-raw QemuImg $c @{ Format = [string]$info.format; Dest = $dst }
     if ([IO.File]::Exists($dst)) { Write-Ok "RAW image: $dst" }
 }
 
@@ -1104,28 +1221,81 @@ function Get-ToolVersion([string]$Tool, [string]$Exe) {
     return Get-FileVersionSafe (Get-Item -LiteralPath $Exe)
 }
 
-# Writes Tools.<Name> = '<path>' into the user's config, keeping every comment and other setting.
-function Set-ConfigTools([hashtable]$Paths) {
+function Set-ConfigTools([hashtable]$Paths) { Set-ConfigValues @{ Tools = $Paths } }
+
+# A literal value as the config holds it: 'text', $true, 42 or an @( ... ) list (possibly over several lines).
+$ConfigValuePattern = '(?:''(?:[^'']|'''')*''|"[^"]*"|\$\w+|@\((?:[^()''"]|''(?:[^'']|'''')*''|"[^"]*")*\)|[\w.]+)'
+$ConfigSections = @{ Tools = @($ToolFiles.Keys); Chainsaw = @('SigmaRules', 'Mapping', 'Rules', 'ExtraArgs') }
+
+function ConvertTo-ConfigLiteral($Value) {
+    if ($Value -is [bool]) { if ($Value) { return '$true' } else { return '$false' } }
+    if ($Value -is [array]) { return '@(' + ((@($Value) | ForEach-Object { ConvertTo-ConfigLiteral $_ }) -join ', ') + ')' }
+    return "'" + ([string]$Value).Replace("'", "''") + "'"
+}
+
+# Where a 'Name = @{ ... }' section sits: Body = just after '@{', End = its closing '}'.
+# Sections hold only quoted strings and @() lists, so the first '}' outside quotes and comments closes them.
+function Get-ConfigSection([string]$Text, [string]$Name) {
+    $m = [regex]::Match($Text, "(?m)^[ \t]*$Name[ \t]*=[ \t]*@\{")
+    if (-not $m.Success) { return $null }
+    $quote = $null
+    for ($i = $m.Index + $m.Length; $i -lt $Text.Length; $i++) {
+        $ch = $Text[$i]
+        if ($quote) { if ($ch -eq $quote) { $quote = $null }; continue }
+        if ($ch -eq "'" -or $ch -eq '"') { $quote = $ch; continue }
+        if ($ch -eq '#') { $i = $Text.IndexOf("`n", $i); if ($i -lt 0) { break }; continue }
+        if ($ch -eq '}') { return @{ Start = $m.Index; Body = $m.Index + $m.Length; End = $i } }
+    }
+    return $null
+}
+
+# Replaces the value of Key between Start and End (skipping the spans in $Skip); $null when the key is not there.
+function Set-ConfigKey([string]$Text, [int]$Start, [int]$End, [string]$Key, [string]$Literal, [object[]]$Skip = @()) {
+    $re = New-Object regex ("(?m)^([ \t]*$Key[ \t]*=[ \t]*)$ConfigValuePattern")
+    foreach ($m in $re.Matches($Text.Substring(0, $End), $Start)) {
+        $at = $m.Index
+        if (@($Skip | Where-Object { $at -ge $_.Start -and $at -le $_.End }).Count) { continue }
+        $prefix = $m.Groups[1].Value
+        return $Text.Substring(0, $at) + $prefix + $Literal + $Text.Substring($at + $m.Length)
+    }
+    return $null
+}
+
+# Writes settings into the user's config in place, keeping every comment and every setting not given.
+# $Values: top-level keys of $Defaults; Tools and Chainsaw take a hashtable of their own keys.
+function Set-ConfigValues([hashtable]$Values) {
     if (-not [IO.File]::Exists($ConfigFile)) {
         [void][IO.Directory]::CreateDirectory($InstallDir)
         Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'ForensicAid.config.psd1') -Destination $ConfigFile
     }
     $text = [IO.File]::ReadAllText($ConfigFile)
-    if ($text -notmatch '(?m)^\s*Tools\s*=\s*@\{') {
-        # A trimmed-down config without a Tools section: add an empty one before the closing brace.
-        $last = $text.LastIndexOf('}')
-        if ($last -lt 0) { throw "$ConfigFile does not look like a PowerShell data file - add the paths by hand." }
-        $text = $text.Insert($last, "`r`n    Tools = @{`r`n    }`r`n")
-    }
-    foreach ($tool in $Paths.Keys) {
-        $value = "'" + $Paths[$tool].Replace("'", "''") + "'"
-        $re = New-Object regex ("(?m)^(\s*$tool\s*=\s*)'[^']*'")
-        if ($re.IsMatch($text)) {
-            $text = $re.Replace($text, [Text.RegularExpressions.MatchEvaluator] { param($m) $m.Groups[1].Value + $value }, 1)
-        } elseif ($text -match '(?m)^\s*Tools\s*=\s*@\{[^\r\n]*\r?\n') {
-            $text = $text.Insert($Matches[0].Length + $text.IndexOf($Matches[0]), "        $tool = $value`r`n")
+    $nl = if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }
+    $last = $text.LastIndexOf('}')
+    if ($last -lt 0) { throw "$ConfigFile does not look like a PowerShell data file - fix it by hand." }
+
+    foreach ($key in $Values.Keys) {
+        if (-not $Defaults.ContainsKey($key)) { throw "Unknown setting '$key'." }
+        if ($ConfigSections.ContainsKey($key)) {
+            $sub = $Values[$key]
+            if ($sub -isnot [hashtable]) { throw "Setting '$key' takes a list of named values." }
+            if (-not (Get-ConfigSection $text $key)) {
+                # A trimmed-down config without this section: add an empty one before the closing brace.
+                $text = $text.Insert($text.LastIndexOf('}'), "    $key = @{$nl    }$nl")
+            }
+            foreach ($name in $sub.Keys) {
+                if ($ConfigSections[$key] -notcontains $name) { throw "Unknown setting '$key.$name'." }
+                $sec = Get-ConfigSection $text $key
+                $literal = ConvertTo-ConfigLiteral $sub[$name]
+                $new = Set-ConfigKey $text $sec.Body $sec.End $name $literal
+                if ($null -eq $new) { $new = $text.Insert($sec.Body, "$nl        $name = $literal") }
+                $text = $new
+            }
         } else {
-            throw "No 'Tools = @{' section in $ConfigFile - add the paths by hand."
+            $skip = @($ConfigSections.Keys | ForEach-Object { Get-ConfigSection $text $_ } | Where-Object { $_ })
+            $literal = ConvertTo-ConfigLiteral $Values[$key]
+            $new = Set-ConfigKey $text 0 $text.Length $key $literal $skip
+            if ($null -eq $new) { $new = $text.Insert($text.LastIndexOf('}'), "    $key = $literal$nl") }
+            $text = $new
         }
     }
     # Validate before replacing the user's file; keep the previous version next to it.
@@ -1221,8 +1391,19 @@ function Show-Doctor {
     Write-Host "Roots   : $((@($script:Config.ToolRoots) | ForEach-Object { Expand-PathValue $_ }) -join '; ')"
     Write-Host "Output  : $($script:Config.OutputMode) (fallback: $(Expand-PathValue $script:Config.OutputRoot))"
     Show-ToolTable
+    $custom = @($Catalog | Where-Object { $_.Custom })
+    if ($custom.Count -or $script:ActionErrors.Count) {
+        Write-Host ''
+        Write-Host 'Custom items' -ForegroundColor White
+        foreach ($e in $custom) {
+            $exe = Resolve-EntryExe $e
+            if ($exe) { Write-Host ('  [+] {0,-22}{1}' -f $e.Id, $exe) -ForegroundColor Green }
+            else      { Write-Host ('  [-] {0,-22}program not found: {1}' -f $e.Id, $e.Program) -ForegroundColor DarkYellow }
+        }
+        foreach ($err in $script:ActionErrors) { Write-Host "  [x] $err" -ForegroundColor Red }
+    }
     Write-Host ''
-    Write-Info 'Missing tools: drop them under one of the roots or set Tools.<Name> in the config, then use "Refresh menu".'
+    Write-Info 'Missing tools: drop them under one of the roots or set the path in Settings, then use "Refresh menu".'
     Write-MenuHint
 }
 
@@ -1251,67 +1432,210 @@ function ConvertTo-Aqs($Match) {
 # Menu order follows this list; a separator is drawn where Group changes.
 # Scope: File = right-click on a file, Dir = folder, drive or folder background.
 # Match: AQS filter so file items only show for matching files.
+$HiveVar = @{ HiveArgs = '--nl when the hive is dirty and has no .LOG1/.LOG2 next to it, else nothing' }
+$TempVar = @{ TempArgs = '--temp <results>\_temp for EZ tools from 2026.10 (they copy databases next to their exe), else nothing' }
 $Catalog = @(
     @{ Id = 'hash'; Title = 'Hash (MD5/SHA1/SHA256)'; Group = 1; Scope = 'File', 'Dir'; NoOutput = $true
        Run = { param($c) Invoke-Hash $c } }
     @{ Id = 'timeline'; Title = 'Open in Timeline Explorer'; Group = 1; Scope = 'File'; Tool = 'TimelineExplorer'
        Match = (FileMatch -Ext '.csv', '.xlsx', '.tle_sess'); NoOutput = $true; Hidden = $true; NoPause = $true
-       Run = { param($c) Start-Process -FilePath (Resolve-Tool TimelineExplorer) -ArgumentList (ConvertTo-ArgumentString @($c.Path)) } }
+       Command = '{Path}'
+       Run = { param($c) Start-Process -FilePath (Resolve-Tool TimelineExplorer) -ArgumentList (Expand-CommandTemplate (Get-EntryCommand $c.Entry) (Get-BaseVars $c)) } }
     @{ Id = 'triage'; Title = 'Full triage (all parsers)'; Group = 1; Scope = 'Dir'
        Run = { param($c) Invoke-Triage $c } }
 
     @{ Id = 'chainsaw'; Title = 'Event logs - Chainsaw hunt'; Group = 2; Scope = 'File', 'Dir'; Tool = 'Chainsaw'
-       Match = (FileMatch -Ext '.evtx'); Run = { param($c) Invoke-Chainsaw $c } }
+       Match = (FileMatch -Ext '.evtx'); Command = 'hunt {Path} {RuleArgs} --csv -o "{Out}\chainsaw" {ExtraArgs}'
+       Vars = @{ RuleArgs = '-s <Sigma rules> -m <mapping> and/or -r <Chainsaw rules>, from Settings > General'
+                 ExtraArgs = 'Chainsaw.ExtraArgs from the config file (default --skip-errors)' }
+       Run = { param($c) Invoke-Chainsaw $c } }
     @{ Id = 'evtx'; Title = 'Event logs - EvtxECmd'; Group = 2; Scope = 'File', 'Dir'; Tool = 'EvtxECmd'
-       Match = (FileMatch -Ext '.evtx'); Run = { param($c) Invoke-Ez EvtxECmd $c } }
+       Match = (FileMatch -Ext '.evtx'); Command = '{In} --csv {Out}'; Run = { param($c) Invoke-ItemCommand evtx EvtxECmd $c } }
 
     @{ Id = 'mft'; Title = 'NTFS ($MFT/$J/$Boot/$SDS) - MFTECmd'; Group = 3; Scope = 'File'; Tool = 'MFTECmd'
-       Match = (FileMatch -Name '$MFT', '$J', '$LogFile', '$Boot', '$SDS', '$Secure_$SDS', '$I30' -Prefix '$UsnJrnl'); Run = { param($c) Invoke-Mft $c } }
+       Match = (FileMatch -Name '$MFT', '$J', '$LogFile', '$Boot', '$SDS', '$Secure_$SDS', '$I30' -Prefix '$UsnJrnl')
+       Command = '{In} --csv {Out} {MftArg}'; Vars = @{ MftArg = '-m <$MFT next to it> for $J / $LogFile, to resolve parent paths' }
+       Run = { param($c) Invoke-Mft $c } }
     @{ Id = 'prefetch'; Title = 'Prefetch - PECmd'; Group = 3; Scope = 'File', 'Dir'; Tool = 'PECmd'
-       Match = (FileMatch -Ext '.pf'); Run = { param($c) Invoke-Ez PECmd $c -Quiet } }
+       Match = (FileMatch -Ext '.pf'); Command = '{In} --csv {Out} -q'; Run = { param($c) Invoke-ItemCommand prefetch PECmd $c } }
     @{ Id = 'lnk'; Title = 'LNK files - LECmd'; Group = 3; Scope = 'File', 'Dir'; Tool = 'LECmd'
-       Match = (FileMatch -Ext '.lnk'); Run = { param($c) Invoke-Ez LECmd $c -Quiet } }
+       Match = (FileMatch -Ext '.lnk'); Command = '{In} --csv {Out} -q'; Run = { param($c) Invoke-ItemCommand lnk LECmd $c } }
     @{ Id = 'jumplist'; Title = 'Jump lists - JLECmd'; Group = 3; Scope = 'File', 'Dir'; Tool = 'JLECmd'
-       Match = (FileMatch -Ext '.automaticDestinations-ms', '.customDestinations-ms'); Run = { param($c) Invoke-Ez JLECmd $c -Quiet } }
+       Match = (FileMatch -Ext '.automaticDestinations-ms', '.customDestinations-ms'); Command = '{In} --csv {Out} -q'
+       Run = { param($c) Invoke-ItemCommand jumplist JLECmd $c } }
     @{ Id = 'recyclebin'; Title = 'Recycle Bin ($I) - RBCmd'; Group = 3; Scope = 'File', 'Dir'; Tool = 'RBCmd'
-       Match = (FileMatch -Prefix '$I' -Exclude '$I30'); Run = { param($c) Invoke-Ez RBCmd $c -Quiet } }
+       Match = (FileMatch -Prefix '$I' -Exclude '$I30'); Command = '{In} --csv {Out} -q'; Run = { param($c) Invoke-ItemCommand recyclebin RBCmd $c } }
     @{ Id = 'rdpcache'; Title = 'RDP bitmap cache (tiles + collage)'; Group = 3; Scope = 'File', 'Dir'
        Match = (FileMatch -Ext '.bmc' -Name 'Cache0000.bin', 'Cache0001.bin', 'Cache0002.bin', 'Cache0003.bin', 'Cache0004.bin')
        Run = { param($c) Invoke-RdpCache $c } }
     @{ Id = 'rdp-stitch'; Title = 'Open tiles in RdpCacheStitcher'; Group = 3; Scope = 'Dir'; Tool = 'RdpCacheStitcher'; NoOutput = $true
        Run = { param($c) Open-RdpCacheStitcher (Find-RdpTileFolders $c.Path) } }
     @{ Id = 'amcache'; Title = 'Amcache - AmcacheParser'; Group = 3; Scope = 'File'; Tool = 'AmcacheParser'
-       Match = (FileMatch -Name 'Amcache.hve'); Run = { param($c) Invoke-Ez AmcacheParser $c -Extra (@('-i') + @(Get-HiveArgs $c.Path) + @(Get-EzTempArgs AmcacheParser $c)) } }
+       Match = (FileMatch -Name 'Amcache.hve'); Command = '{In} --csv {Out} -i {HiveArgs} {TempArgs}'; Vars = $HiveVar + $TempVar
+       Run = { param($c) Invoke-ItemCommand amcache AmcacheParser $c @{ HiveArgs = @(Get-HiveArgs $c.Path); TempArgs = @(Get-EzTempArgs AmcacheParser $c) } } }
     @{ Id = 'shimcache'; Title = 'ShimCache - AppCompatCacheParser'; Group = 3; Scope = 'File'; Tool = 'AppCompatCacheParser'
-       Match = (FileMatch -Name 'SYSTEM'); Run = { param($c) Invoke-Ez AppCompatCacheParser $c -Extra @(Get-HiveArgs $c.Path) } }
+       Match = (FileMatch -Name 'SYSTEM'); Command = '{In} --csv {Out} {HiveArgs}'; Vars = $HiveVar
+       Run = { param($c) Invoke-ItemCommand shimcache AppCompatCacheParser $c @{ HiveArgs = @(Get-HiveArgs $c.Path) } } }
 
     @{ Id = 'registry'; Title = 'Registry - RECmd (batch)'; Group = 4; Scope = 'File', 'Dir'; Tool = 'RECmd'
        Match = (FileMatch -Name 'NTUSER.DAT', 'UsrClass.dat', 'SYSTEM', 'SOFTWARE', 'SAM', 'SECURITY', 'DEFAULT', 'Amcache.hve')
+       Command = '{In} --csv {Out} --bn {Batch} {HiveArgs}'
+       Vars = @{ Batch = 'the RECmd batch file (Settings > General)'
+                 HiveArgs = '--nl for a dirty hive without .LOG1/.LOG2 (folders: such hives get a separate run with --nl)' }
        Run = { param($c) Invoke-RECmd $c } }
     @{ Id = 'shellbags'; Title = 'ShellBags - SBECmd'; Group = 4; Scope = 'Dir'; Tool = 'SBECmd'
-       Run = { param($c) Invoke-SBECmd $c } }
+       Command = '{In} --csv {Out}'; Run = { param($c) Invoke-SBECmd $c } }
 
     @{ Id = 'srum'; Title = 'SRUM - SrumECmd'; Group = 5; Scope = 'File', 'Dir'; Tool = 'SrumECmd'
-       Match = (FileMatch -Name 'SRUDB.dat'); Run = { param($c) Invoke-Srum $c } }
+       Match = (FileMatch -Name 'SRUDB.dat'); Command = '-f {Db} --csv {Out} {TempArgs} {SoftwareArg}'
+       Vars = @{ Db = 'the repaired copy of SRUDB.dat in <results>\_db_copy'; SoftwareArg = '-r <SOFTWARE hive> when one is found, else nothing' } + $TempVar
+       Run = { param($c) Invoke-Srum $c } }
     @{ Id = 'ual'; Title = 'UAL (SUM) - SumECmd'; Group = 5; Scope = 'File', 'Dir'; Tool = 'SumECmd'
-       Match = (FileMatch -Ext '.mdb'); Run = { param($c) Invoke-Sum $c } }
+       Match = (FileMatch -Ext '.mdb'); Command = '-d {Db} --csv {Out} {TempArgs}'
+       Vars = @{ Db = 'the folder with repaired copies of the *.mdb databases (<results>\_db_copy)' } + $TempVar
+       Run = { param($c) Invoke-Sum $c } }
     @{ Id = 'activities'; Title = 'Windows Timeline - WxTCmd'; Group = 5; Scope = 'File'; Tool = 'WxTCmd'
-       Match = (FileMatch -Name 'ActivitiesCache.db'); Run = { param($c) Invoke-WxT $c } }
+       Match = (FileMatch -Name 'ActivitiesCache.db'); Command = '-f {Db} --csv {Out} {TempArgs}'
+       Vars = @{ Db = 'a copy of ActivitiesCache.db (with -wal/-shm) in <results>\_db_copy' } + $TempVar
+       Run = { param($c) Invoke-WxT $c } }
     @{ Id = 'ese-repair'; Title = 'Repair ESE database (copy)'; Group = 5; Scope = 'File'
        Match = (FileMatch -Ext '.edb', '.mdb' -Name 'SRUDB.dat' -Prefix 'WebCacheV'); Run = { param($c) Invoke-EseRepair $c } }
 
     @{ Id = 'to-raw'; Title = 'Disk image to RAW (.dd) - qemu-img'; Group = 6; Scope = 'File'; Tool = 'QemuImg'
-       Match = (FileMatch -Ext '.vhdx', '.vhd', '.vmdk', '.qcow2', '.vdi'); Run = { param($c) Invoke-ToRaw $c } }
+       Match = (FileMatch -Ext '.vhdx', '.vhd', '.vmdk', '.qcow2', '.vdi'); Command = 'convert -p -f {Format} -O raw {Path} {Dest}'
+       Vars = @{ Format = 'the image format qemu-img detected (vhdx, vmdk, ...)'; Dest = '<results>\<image name>.dd' }
+       Run = { param($c) Invoke-ToRaw $c } }
 
     @{ Id = 'scan-tools'; Title = 'Find tools on this PC'; Group = 9; Scope = 'File', 'Dir'; NoOutput = $true; NoPath = $true
        Run = { param($c) Invoke-ScanTools } }
     @{ Id = 'doctor'; Title = 'Check tools'; Group = 9; Scope = 'File', 'Dir'; NoOutput = $true; NoPath = $true
        Run = { param($c) Show-Doctor } }
-    @{ Id = 'config'; Title = 'Edit configuration'; Group = 9; Scope = 'File', 'Dir'; NoOutput = $true; NoPath = $true; Hidden = $true; NoPause = $true
+    @{ Id = 'config'; Title = 'Settings'; Group = 9; Scope = 'File', 'Dir'; NoOutput = $true; NoPath = $true; Hidden = $true; NoPause = $true
        Run = { param($c) Open-Config } }
     @{ Id = 'refresh'; Title = 'Refresh menu (after config change)'; Group = 9; Scope = 'File', 'Dir'; NoOutput = $true; NoPath = $true
        Run = { param($c) Register-Menu } }
 )
+
+#endregion
+
+#region Menu item files
+
+# actions\<id>.psd1, one file per item so items can be shared. A file named after a built-in item
+# holds only its Command; any other file is a custom item:
+#   @{ Title = 'Foo - FooParser'; Program = 'C:\Tools\Foo.exe'; Command = '-f {Path} --csv {Out}'
+#      Scope = @('File'); Ext = @('.foo'); Name = @(); Prefix = @()
+#      Signature = @{ Offset = 0; Hex = '464F4F00' }   # optional, checked before the program runs
+#      Output = $true    # create a results folder ({Out})
+#      Wait = $true }    # run in the ForensicAid console; $false starts it and returns (viewers)
+$ActionsDir = Join-Path $InstallDir 'actions'
+$CustomKeys = 'Title', 'Program', 'Command', 'Scope', 'Ext', 'Name', 'Prefix', 'Signature', 'Output', 'Wait'
+$script:ActionErrors = @()
+
+function ConvertTo-Signature($Value) {
+    if (-not $Value -or -not $Value.Hex) { return $null }
+    $hex = ([string]$Value.Hex -replace '[\s-]', '').ToUpperInvariant()
+    if ($hex -notmatch '^([0-9A-F]{2})+$') { throw 'Signature.Hex must be pairs of hex digits, e.g. 4D5A9000.' }
+    $offset = [int64]$Value.Offset
+    if ($offset -lt 0) { throw 'Signature.Offset cannot be negative.' }
+    return @{ Offset = $offset; Hex = $hex }
+}
+
+function Import-ActionFiles {
+    # Safe to call again after the files changed: start from the built-in items only.
+    $script:Catalog = @($Catalog | Where-Object { -not $_.Custom })
+    foreach ($e in $Catalog) { $e.Remove('UserCommand') }
+    $script:ActionErrors = @()
+    if (-not [IO.Directory]::Exists($ActionsDir)) { return }
+    $custom = @()
+    foreach ($f in (Get-ChildItem -LiteralPath $ActionsDir -Filter '*.psd1' -File | Sort-Object Name)) {
+        $id = $f.BaseName
+        try {
+            if ($id -notmatch '^[A-Za-z0-9][A-Za-z0-9_-]*$') { throw 'the file name may only use letters, digits, - and _' }
+            $d = Import-PowerShellDataFile -LiteralPath $f.FullName
+            $builtin = $Catalog | Where-Object { $_.Id -eq $id } | Select-Object -First 1
+            if ($builtin) {
+                if (-not $builtin.Command) { throw "'$($builtin.Title)' does not run a single program, so its command cannot be changed" }
+                if ($d.Command) { $builtin.UserCommand = [string]$d.Command }
+                continue
+            }
+            foreach ($k in 'Title', 'Program', 'Command') { if (-not $d[$k]) { throw "$k is missing" } }
+            $scope = @($d.Scope | Where-Object { $_ })
+            if (-not $scope.Count) { $scope = @('File') }
+            foreach ($s in $scope) { if ($s -notin 'File', 'Dir') { throw "Scope '$s' - use File and/or Dir" } }
+            $ext = @($d.Ext | Where-Object { $_ } | ForEach-Object { if ($_ -like '.*') { $_ } else { ".$_" } })
+            $names = @($d.Name | Where-Object { $_ })
+            $prefixes = @($d.Prefix | Where-Object { $_ })
+            $wait = $d.Wait -ne $false
+            $custom += @{
+                Id = $id; Title = [string]$d.Title; Group = 7; Scope = $scope; Custom = $true
+                Program = [string]$d.Program; Command = [string]$d.Command; Signature = (ConvertTo-Signature $d.Signature)
+                Match = $(if ($ext.Count + $names.Count + $prefixes.Count) { FileMatch -Ext $ext -Name $names -Prefix $prefixes } else { $null })
+                NoOutput = $d.Output -eq $false; Wait = $wait; Hidden = -not $wait; NoPause = -not $wait
+                Run = { param($c) Invoke-CustomItem $c }
+            }
+        } catch {
+            $script:ActionErrors += "$($f.Name): $($_.Exception.Message)"
+        }
+    }
+    # Custom items go after the built-in parsers, before the items that manage ForensicAid itself.
+    if ($custom.Count) { $script:Catalog = @($Catalog | Where-Object { $_.Group -lt 9 }) + $custom + @($Catalog | Where-Object { $_.Group -ge 9 }) }
+}
+
+# Writes (or with $null removes) actions\<id>.psd1 - validated before it replaces the old file.
+function Save-ActionFile([string]$Id, $Def) {
+    if ($Id -notmatch '^[A-Za-z0-9][A-Za-z0-9_-]*$') { throw "Bad item id '$Id' - use letters, digits, - and _." }
+    $file = Join-Path $ActionsDir "$Id.psd1"
+    if ($null -eq $Def) {
+        if ([IO.File]::Exists($file)) { Remove-Item -LiteralPath $file -Force }
+        return
+    }
+    $builtin = $Catalog | Where-Object { $_.Id -eq $Id -and -not $_.Custom } | Select-Object -First 1
+    $keys = if ($builtin) { @('Command') } else { $CustomKeys }
+    foreach ($k in $Def.Keys) { if ($keys -notcontains $k) { throw "Item '$Id': unknown setting '$k'." } }
+    if ($builtin -and -not $builtin.Command) { throw "'$($builtin.Title)' does not run a single program, so its command cannot be changed." }
+
+    $lines = @('# ForensicAid menu item - edited in Settings > Menu items (see docs/ADVANCED.md).', '@{')
+    foreach ($k in $keys) {
+        if (-not $Def.ContainsKey($k)) { continue }
+        $v = $Def[$k]
+        if ($k -eq 'Signature') {
+            $sig = ConvertTo-Signature $v
+            if ($sig) { $lines += "    Signature = @{{ Offset = {0}; Hex = '{1}' }}" -f $sig.Offset, $sig.Hex }
+            continue
+        }
+        if ($k -in 'Scope', 'Ext', 'Name', 'Prefix') { $v = @($v | Where-Object { $_ -is [string] -and $_ }) }
+        $lines += "    $k = $(ConvertTo-ConfigLiteral $v)"
+    }
+    $lines += '}'
+    [void][IO.Directory]::CreateDirectory($ActionsDir)
+    $tmp = "$file.new"
+    [IO.File]::WriteAllText($tmp, (($lines -join "`r`n") + "`r`n"), (New-Object Text.UTF8Encoding($true)))
+    try {
+        $d = Import-PowerShellDataFile -LiteralPath $tmp
+        if (-not $builtin) { foreach ($k in 'Title', 'Program', 'Command') { if (-not $d[$k]) { throw "$k is missing" } } }
+    } catch { Remove-Item -LiteralPath $tmp; throw "Item '$Id' not saved: $($_.Exception.Message)" }
+    Move-Item -LiteralPath $tmp -Destination $file -Force
+}
+
+# Menu items on/off: off goes to the tray's state file; on also takes the id out of the config's Disabled list.
+function Set-ItemsEnabled([hashtable]$Enabled) {
+    $state = [System.Collections.Generic.List[string]]@(Get-MenuState)
+    $user = @()
+    if ([IO.File]::Exists($ConfigFile)) { try { $user = @((Import-PowerShellDataFile -LiteralPath $ConfigFile).Disabled | Where-Object { $_ }) } catch { } }
+    $configList = [System.Collections.Generic.List[string]]$user
+    foreach ($id in $Enabled.Keys) {
+        if ($Enabled[$id]) {
+            [void]$state.Remove($id)
+            [void]$configList.Remove($id)
+        } elseif (-not $state.Contains($id) -and -not $configList.Contains($id)) {
+            $state.Add($id)
+        }
+    }
+    [void][IO.Directory]::CreateDirectory($InstallDir)
+    [IO.File]::WriteAllText($StateFile, (ConvertTo-Json -InputObject @{ Disabled = @($state) } -Compress))
+    if ($configList.Count -ne $user.Count) { Set-ConfigValues @{ Disabled = @($configList) } }
+}
+
 
 #endregion
 
@@ -1362,11 +1686,8 @@ function Register-Menu {
     # Items that make it into the menu, with their tool icon.
     $shown = foreach ($e in $Catalog) {
         if (@($script:Config.Disabled) -contains $e.Id) { continue }
-        $exe = $null
-        if ($e.Tool) {
-            $exe = Resolve-Tool $e.Tool -Optional
-            if (-not $exe -and $script:Config.HideUnavailable) { continue }
-        }
+        $exe = Resolve-EntryExe $e
+        if (($e.Tool -or $e.Program) -and -not $exe -and $script:Config.HideUnavailable) { continue }
         @{ Entry = $e; Icon = $(if ($exe) { "$exe,0" } else { '' }) }
     }
 
@@ -1552,11 +1873,51 @@ function Stop-Tray {
     if ($procs.Count) { Write-Ok 'Tray icon stopped.' }
 }
 
+function Get-TaskFolder {
+    $svc = New-Object -ComObject Schedule.Service
+    $svc.Connect()
+    return $svc.GetFolder('\')
+}
+
+# A logon task, not HKCU\...\Run: Windows holds Run entries back until Explorer has settled, which
+# can put the tray icon a minute or more behind the desktop. Same task as in ForensicAidTray.ps1.
+function Register-TrayTask([string]$PsExe, [string]$Arguments) {
+    $user = [Security.SecurityElement]::Escape([Security.Principal.WindowsIdentity]::GetCurrent().Name)
+    $xml = @"
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>ForensicAid tray icon</Description></RegistrationInfo>
+  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>$user</UserId></LogonTrigger></Triggers>
+  <Principals><Principal id="Author"><UserId>$user</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>5</Priority>
+  </Settings>
+  <Actions Context="Author"><Exec><Command>$([Security.SecurityElement]::Escape($PsExe))</Command><Arguments>$([Security.SecurityElement]::Escape($Arguments))</Arguments></Exec></Actions>
+</Task>
+"@
+    [void](Get-TaskFolder).RegisterTask($TaskName, $xml, 6, $null, $null, 3)   # create or update, interactive token
+}
+
+function Remove-TrayAutostart {
+    try { (Get-TaskFolder).DeleteTask($TaskName, 0) } catch { }   # throws when there is no task
+    $k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($RunKey, $true)
+    if ($k) { try { $k.DeleteValue('ForensicAidTray', $false) } finally { $k.Close() } }
+}
+
 function Start-Tray {
     if (-not [IO.File]::Exists($TrayScript)) { Write-Warn "Tray icon not found: $TrayScript"; return }
     $psExe = Join-Path $PSHOME 'powershell.exe'
     $trayArgs = '-NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File "{0}"' -f $TrayScript
-    Set-RegValues $RunKey @{ ForensicAidTray = ('"{0}" {1}' -f $psExe, $trayArgs) }
+    Remove-TrayAutostart   # also drops the Run value older versions used
+    try {
+        Register-TrayTask $psExe $trayArgs
+    } catch {
+        Write-Warn "Logon task not created ($($_.Exception.Message)) - using the Run key, which starts later."
+        Set-RegValues $RunKey @{ ForensicAidTray = ('"{0}" {1}' -f $psExe, $trayArgs) }
+    }
     Start-Process -FilePath $psExe -ArgumentList $trayArgs -WindowStyle Hidden
     Write-Ok 'Tray icon started (also at logon - untick "Start with Windows" in its menu to stop that).'
 }
@@ -1658,7 +2019,7 @@ function Install-ForensicAid {
     [void][IO.Directory]::CreateDirectory($InstallDir)
     $src = [IO.Path]::GetFullPath($PSScriptRoot).TrimEnd('\')
     if ($src -ine [IO.Path]::GetFullPath($InstallDir).TrimEnd('\')) {
-        foreach ($f in 'ForensicAid.ps1', 'ForensicAidTray.ps1', 'icon.ico') {
+        foreach ($f in 'ForensicAid.ps1', 'ForensicAidTray.ps1', 'ForensicAidSettings.ps1', 'icon.ico') {
             Copy-Item -LiteralPath (Join-Path $src $f) -Destination $InstallDir -Force
         }
         if ($ResetConfig -or -not [IO.File]::Exists($ConfigFile)) {
@@ -1681,25 +2042,24 @@ function Install-ForensicAid {
     if ($withTray) { Start-Tray } else { Write-Info 'Test mode (FORENSICAID_REGROOT): tray icon not started or added to autostart.' }
     Show-ToolTable
     Write-Host ''
-    Write-Info "Edit tool paths in $ConfigFile and use ForensicAid > Refresh menu."
+    Write-Info "Change tool paths and settings in ForensicAid > Settings (also in the tray icon menu)."
     Write-MenuHint
 }
 
 function Uninstall-ForensicAid {
     if (-not $env:FORENSICAID_REGROOT) {
         Stop-Tray
-        $k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($RunKey, $true)
-        if ($k) { try { $k.DeleteValue('ForensicAidTray', $false) } finally { $k.Close() } }
+        Remove-TrayAutostart
     }
     Uninstall-ShellExtension
     Remove-Menu
     Send-ShellRefresh
     Write-Ok 'Context menu removed.'
-    foreach ($f in 'ForensicAid.ps1', 'ForensicAidTray.ps1', 'icon.ico', 'tools.cache.json', 'menu.json') {
+    foreach ($f in 'ForensicAid.ps1', 'ForensicAidTray.ps1', 'ForensicAidSettings.ps1', 'icon.ico', 'tools.cache.json', 'menu.json') {
         $p = Join-Path $InstallDir $f
         if ([IO.File]::Exists($p)) { Remove-Item -LiteralPath $p -Force }
     }
-    Write-Info "Config and history kept in $InstallDir - delete the folder to remove them."
+    Write-Info "Config, menu items (actions folder) and history kept in $InstallDir - delete the folder to remove them."
     $left = @(Get-LegacyItems)
     if ($left.Count) { Write-Warn "Entries from older versions are still present ($($left.Count)); install.cmd offers to remove them." }
 }
@@ -1707,6 +2067,8 @@ function Uninstall-ForensicAid {
 #endregion
 
 #region Main
+
+Import-ActionFiles
 
 if ($Install)   { Install-ForensicAid; return }
 if ($ScanTools) {
@@ -1732,6 +2094,95 @@ if ($RegisterMenu) {
     return
 }
 
+# JSON for the settings window - stdout must carry nothing but the JSON.
+if ($SettingsInfo) {
+    try {
+        $script:Config = Import-Config
+        $tools = foreach ($t in $ToolFiles.Keys) {
+            $resolved = Resolve-Tool $t -Optional
+            [pscustomobject]@{
+                Name       = $t
+                Configured = [string]$script:Config.Tools[$t]
+                Resolved   = [string]$resolved
+                Version    = $(if ($resolved) { [string](Get-ToolVersion $t $resolved) } else { '' })
+            }
+        }
+        $cs = Get-ChainsawRuleSet
+        $shown = @{}   # not $config: that is $script:Config at this scope
+        foreach ($k in $Defaults.Keys) { if ($k -notin 'Tools', 'Disabled') { $shown[$k] = $script:Config[$k] } }
+        $items = foreach ($e in $Catalog) {
+            $m = $e.Match
+            [pscustomobject]@{
+                Id             = $e.Id
+                Title          = $e.Title
+                Group          = $e.Group
+                Scope          = @($e.Scope)
+                Tool           = [string]$e.Tool
+                Program        = [string]$e.Program
+                Exe            = [string](Resolve-EntryExe $e)
+                Custom         = [bool]$e.Custom
+                Enabled        = @($script:Config.Disabled) -notcontains $e.Id
+                Command        = [string](Get-EntryCommand $e)
+                DefaultCommand = $(if ($e.Custom) { '' } else { [string]$e.Command })
+                Vars           = $e.Vars
+                Ext            = @($m.Ext); Name = @($m.Name); Prefix = @($m.Prefix)
+                Signature      = $e.Signature
+                Output         = -not $e.NoOutput
+                Wait           = [bool]$e.Wait
+            }
+        }
+        [pscustomobject]@{
+            ConfigFile = $ConfigFile
+            ActionsDir = $ActionsDir
+            Config     = $shown
+            Tools      = @($tools)
+            Items      = @($items)
+            Errors     = @($script:ActionErrors)
+            InUse      = @{ SigmaRules = [string]$cs.Sigma; Mapping = [string]$cs.Mapping; Rules = [string]$cs.Rules
+                            RECmdBatch = [string](Get-RECmdBatch (Resolve-Tool RECmd -Optional)) }
+        } | ConvertTo-Json -Depth 4
+    } catch {
+        [Console]::Error.WriteLine($_.Exception.Message)
+        exit 1
+    }
+    return
+}
+
+if ($SetConfig) {
+    try {
+        $json = [IO.File]::ReadAllText($SetConfig) | ConvertFrom-Json
+        # Two levels of objects become hashtables: Tools.<name>, Actions.<id>.<setting> (Signature is a third).
+        $toHash = {
+            param($o)
+            if ($o -isnot [Management.Automation.PSCustomObject]) { return , $o }
+            $h = @{}
+            foreach ($q in $o.PSObject.Properties) { $h[$q.Name] = (& $toHash $q.Value) }
+            return $h
+        }
+        $values = & $toHash $json
+        # Items first: a config error must not leave them half done, and they are independent of it.
+        if ($values.ContainsKey('Actions')) {
+            $savedIds = @($values.Actions.Keys)
+            foreach ($id in $savedIds) { Save-ActionFile $id $values.Actions[$id] }
+            $values.Remove('Actions')
+            Import-ActionFiles
+            $bad = @($script:ActionErrors | Where-Object { $savedIds -contains ($_ -replace '\.psd1:.*$', '') })
+            if ($bad.Count) { throw ($bad -join "`n") }
+            Write-Ok "Menu items saved in $ActionsDir"
+        }
+        if ($values.ContainsKey('Enabled')) {
+            Set-ItemsEnabled $values.Enabled
+            $values.Remove('Enabled')
+        }
+        if ($values.Count) {
+            Set-ConfigValues $values
+            Write-Ok "Saved $ConfigFile (previous version: ForensicAid.config.psd1.bak)."
+        }
+        Register-Menu
+    } catch { Write-Err $_.Exception.Message; exit 1 }
+    return
+}
+
 # JSON for the tray icon - stdout must carry nothing but the JSON.
 if ($ListActions) {
     try {
@@ -1746,7 +2197,7 @@ if ($ListActions) {
                 Group          = $e.Group
                 Scope          = @($e.Scope)
                 Tool           = $e.Tool
-                Available      = (-not $e.Tool) -or [bool](Resolve-Tool $e.Tool -Optional)
+                Available      = (-not ($e.Tool -or $e.Program)) -or [bool](Resolve-EntryExe $e)
                 Enabled        = $enabled
                 ConfigDisabled = (-not $enabled) -and ($trayOff -notcontains $e.Id)
                 NoPath         = [bool]$e.NoPath
@@ -1767,7 +2218,7 @@ try {
     try {
         $script:Config = Import-Config
     } catch {
-        # A broken config must not lock out "Edit configuration" / "Check tools".
+        # A broken config must not lock out "Settings" / "Check tools".
         if (-not ($entry -and $entry.NoPath)) { throw }
         Write-Warn $_.Exception.Message
         $script:Config = Import-Config -DefaultsOnly
@@ -1778,7 +2229,7 @@ try {
     # Explorer passes "E:\" for drive roots; the trailing \" turns into a literal quote, so undo that.
     $p = if ($Path) { $Path.Trim().Trim('"') } else { '' }
     if ($p -match '^[A-Za-z]:$') { $p += '\' }
-    $c = @{ Action = $entry.Id; Path = $p; IsDir = $false; Out = $null }
+    $c = @{ Action = $entry.Id; Path = $p; IsDir = $false; Out = $null; Entry = $entry }
 
     if (-not $entry.NoPath) {
         if (-not $p) { throw 'No -Path given.' }
